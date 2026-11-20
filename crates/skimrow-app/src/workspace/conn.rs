@@ -41,6 +41,13 @@ pub(super) struct ConnForm {
     pub(super) error: Option<String>,
     /// Waiting for the live connection to try out a new setup.
     pub(super) applying: bool,
+    /// How the last Test went: the server's version, or why it failed.
+    pub(super) test: Option<Result<String, String>>,
+    /// A Test is running.
+    pub(super) testing: bool,
+    /// Bumped by every Test and every (re)fill, so a late result of an
+    /// earlier one is dropped.
+    pub(super) test_gen: u64,
 }
 
 impl ConnForm {
@@ -98,6 +105,9 @@ impl ConnForm {
             editing: None,
             error: None,
             applying: false,
+            test: None,
+            testing: false,
+            test_gen: 0,
         }
     }
 
@@ -174,7 +184,17 @@ impl ConnForm {
         self.editing = entry.map(|e| e.id.clone());
         self.error = None;
         self.applying = false;
+        self.test = None;
+        self.testing = false;
+        self.test_gen += 1;
     }
+}
+
+/// The connection form's fields, read and checked (`Workspace::read_form`).
+struct ReadForm {
+    entry: ConnectionEntry,
+    password: Option<String>,
+    ssh_secret: Option<String>,
 }
 
 /// The parameter lines worth keeping from the editor text.
@@ -370,52 +390,24 @@ impl Workspace {
         if self.form.applying {
             return;
         }
-        let read = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
-        let name = read(&self.form.name);
-        let host = read(&self.form.host);
-        let user = read(&self.form.user);
-        let dbname = read(&self.form.db);
-        let port = read(&self.form.port).parse().unwrap_or(5432);
-        let ssl = read(&self.form.ssl);
-        let init_sql = self.form.init_sql.read(cx).value().trim().to_string();
-        let params_text = self.form.params.read(cx).value().to_string();
-        let password = self.form.password.read(cx).value().to_string();
-        let ssh_secret = self.form.ssh_secret.read(cx).value().to_string();
-
+        let (form, setup) = match self.read_form(cx) {
+            Ok(read) => read,
+            Err(msg) => {
+                self.form.error = Some(msg);
+                cx.notify();
+                return;
+            }
+        };
         let fail = |this: &mut Self, msg: String, cx: &mut Context<Self>| {
             this.form.error = Some(msg);
             cx.notify();
         };
-        if name.is_empty() || host.is_empty() || user.is_empty() || dbname.is_empty() {
-            return fail(self, "Fill name, host, user, and database".into(), cx);
-        }
-        let setup = match ConnSetup::parse(&params_text, &init_sql) {
-            Ok(setup) => setup,
-            Err(e) => return fail(self, format!("Parameters, {e}"), cx),
-        };
-        let ssh = if self.form.ssh {
-            let (host, user) = (read(&self.form.ssh_host), read(&self.form.ssh_user));
-            if host.is_empty() || user.is_empty() {
-                return fail(self, "Fill the SSH host and user".into(), cx);
-            }
-            let auth = self.form.ssh_auth;
-            Some(SshEntry {
-                host,
-                port: read(&self.form.ssh_port).parse().unwrap_or(22),
-                user,
-                auth,
-                key_file: match auth {
-                    SshAuthKind::Key => read(&self.form.ssh_key),
-                    _ => String::new(),
-                },
-            })
-        } else {
-            None
-        };
-        let ssh_secret = ssh
-            .as_ref()
-            .filter(|s| s.auth != SshAuthKind::Agent && !ssh_secret.is_empty())
-            .map(|_| ssh_secret);
+        let ReadForm {
+            mut entry,
+            password: pw,
+            ssh_secret,
+        } = form;
+        let name = entry.name.clone();
         let editing = self.form.editing.clone();
         if let Some(id) = &editing {
             if self
@@ -432,21 +424,10 @@ impl Workspace {
             }
         }
         self.form.error = None;
-        let entry = ConnectionEntry {
-            id: editing
-                .clone()
-                .unwrap_or_else(|| conn_id_for(&self.settings.connections, &name)),
-            name,
-            host,
-            port,
-            dbname,
-            user,
-            ssl_mode: if ssl.is_empty() { "prefer".into() } else { ssl },
-            params: param_lines(&params_text),
-            init_sql,
-            ssh,
-        };
-        let pw = (!password.is_empty()).then_some(password);
+        self.form.test = None;
+        entry.id = editing
+            .clone()
+            .unwrap_or_else(|| conn_id_for(&self.settings.connections, &name));
 
         let Some(old) = editing.and_then(|id| {
             self.settings
@@ -535,6 +516,148 @@ impl Workspace {
                 self.status = format!("Saved {}", entry.name);
             }
         }
+        cx.notify();
+    }
+
+    /// What the form says, checked: the entry (no id yet), its parsed
+    /// setup, and the secrets typed (`None` = left empty). `Err` = why not.
+    fn read_form(&self, cx: &App) -> Result<(ReadForm, ConnSetup), String> {
+        let read = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
+        let name = read(&self.form.name);
+        let host = read(&self.form.host);
+        let user = read(&self.form.user);
+        let dbname = read(&self.form.db);
+        let port = read(&self.form.port).parse().unwrap_or(5432);
+        let ssl = read(&self.form.ssl);
+        let init_sql = self.form.init_sql.read(cx).value().trim().to_string();
+        let params_text = self.form.params.read(cx).value().to_string();
+        let password = self.form.password.read(cx).value().to_string();
+        let ssh_secret = self.form.ssh_secret.read(cx).value().to_string();
+
+        if name.is_empty() || host.is_empty() || user.is_empty() || dbname.is_empty() {
+            return Err("Fill name, host, user, and database".into());
+        }
+        let setup =
+            ConnSetup::parse(&params_text, &init_sql).map_err(|e| format!("Parameters, {e}"))?;
+        let ssh = if self.form.ssh {
+            let (host, user) = (read(&self.form.ssh_host), read(&self.form.ssh_user));
+            if host.is_empty() || user.is_empty() {
+                return Err("Fill the SSH host and user".into());
+            }
+            let auth = self.form.ssh_auth;
+            Some(SshEntry {
+                host,
+                port: read(&self.form.ssh_port).parse().unwrap_or(22),
+                user,
+                auth,
+                key_file: match auth {
+                    SshAuthKind::Key => read(&self.form.ssh_key),
+                    _ => String::new(),
+                },
+            })
+        } else {
+            None
+        };
+        let ssh_secret = ssh
+            .as_ref()
+            .filter(|s| s.auth != SshAuthKind::Agent && !ssh_secret.is_empty())
+            .map(|_| ssh_secret);
+        let entry = ConnectionEntry {
+            id: String::new(),
+            name,
+            host,
+            port,
+            dbname,
+            user,
+            ssl_mode: if ssl.is_empty() { "prefer".into() } else { ssl },
+            params: param_lines(&params_text),
+            init_sql,
+            ssh,
+        };
+        let password = (!password.is_empty()).then_some(password);
+        Ok((
+            ReadForm {
+                entry,
+                password,
+                ssh_secret,
+            },
+            setup,
+        ))
+    }
+
+    /// The form's Test: connect once with what it says (the saved secrets of
+    /// the entry being edited where none were typed), report the server
+    /// version or the error above the buttons, and close again.
+    pub(super) fn test_connection(&mut self, cx: &mut Context<Self>) {
+        let (form, setup) = match self.read_form(cx) {
+            Ok(read) => read,
+            Err(msg) => {
+                self.form.test = Some(Err(msg));
+                cx.notify();
+                return;
+            }
+        };
+        // Secrets not typed: the edited entry's, saved under its OLD name.
+        let saved_name = self.form.editing.as_ref().and_then(|id| {
+            self.settings
+                .connections
+                .iter()
+                .find(|c| &c.id == id)
+                .map(|c| c.name.clone())
+        });
+        let cached = |account: Option<String>| {
+            account
+                .as_ref()
+                .and_then(|a| self.passwords.get(a).cloned())
+        };
+        let pw = form.password.clone().or_else(|| cached(saved_name.clone()));
+        let wants_ssh_secret = form
+            .entry
+            .ssh
+            .as_ref()
+            .is_some_and(|s| s.auth != SshAuthKind::Agent);
+        let ssh_secret = form
+            .ssh_secret
+            .clone()
+            .or_else(|| cached(saved_name.as_deref().map(ssh_account)));
+        let mut cfg = entry_config(&form.entry, pw, ssh_secret);
+        cfg.setup = setup;
+        let lookup = |account: Option<String>| {
+            account.map(|a| {
+                cx.background_spawn(async move { skimrow_config::secret::get_password(&a) })
+            })
+        };
+        let pw_task = lookup(saved_name.clone().filter(|_| cfg.password.is_none()));
+        let ssh_task =
+            lookup(saved_name.as_deref().map(ssh_account).filter(|_| {
+                wants_ssh_secret && cfg.ssh.as_ref().is_some_and(|s| s.secret.is_none())
+            }));
+        self.form.test_gen += 1;
+        let gen = self.form.test_gen;
+        self.form.testing = true;
+        self.form.test = None;
+        let db = self.db.clone();
+        let fut = async move {
+            if let Some(task) = pw_task {
+                cfg.password = task.await;
+            }
+            if let (Some(task), Some(ssh)) = (ssh_task, &mut cfg.ssh) {
+                ssh.secret = task.await;
+            }
+            db.test(cfg).await
+        };
+        self.spawn_db(cx, fut, move |this, result, _| {
+            // Not if the form was reopened or tested again meanwhile.
+            if this.form.test_gen != gen {
+                return;
+            }
+            this.form.testing = false;
+            this.form.test = Some(result.map_err(|e| match e {
+                // The line already says "Connection failed".
+                DbError::Connect(why) => why,
+                e => e.to_string(),
+            }));
+        });
         cx.notify();
     }
 
@@ -1148,6 +1271,59 @@ mod tests {
                 ws.cancel_conn_form(cx);
                 assert!(!ws.conn_adding && ws.is_modal(Modal::Connections));
             })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn testing_a_connection_reports_above_the_buttons(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (db, mut unserved) = DbHandle::unserved();
+        let window =
+            cx.add_window(|window, cx| Workspace::new(db, Settings::default(), None, window, cx));
+        // Missing fields: refused at once, nothing sent.
+        window
+            .update(cx, |ws, window, cx| {
+                ws.show_add_form(window, cx);
+                ws.test_connection(cx);
+                assert!(!ws.form.testing);
+                assert!(matches!(&ws.form.test, Some(Err(e)) if e.starts_with("Fill")));
+                let form = &ws.form;
+                for (input, text) in [(&form.name, "t"), (&form.user, "u"), (&form.db, "d")] {
+                    type_into(input, text, window, cx);
+                }
+                ws.test_connection(cx);
+                assert!(ws.form.testing && ws.form.test.is_none());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        unserved.refuse_all();
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _, cx| {
+                assert!(!ws.form.testing);
+                assert!(matches!(&ws.form.test, Some(Err(e)) if e.contains("refused")));
+                ws.test_connection(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        unserved.pass_tests("PostgreSQL 16.4");
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, window, cx| {
+                assert_eq!(ws.form.test, Some(Ok("PostgreSQL 16.4".into())));
+                // Nothing was saved or connected by testing.
+                assert!(ws.settings.connections.is_empty() && ws.conn.is_none());
+                // Reopening the form forgets it, and drops a late answer.
+                ws.test_connection(cx);
+                ws.show_add_form(window, cx);
+                assert!(ws.form.test.is_none() && !ws.form.testing);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        unserved.pass_tests("PostgreSQL 16.4");
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _, _| assert!(ws.form.test.is_none()))
             .unwrap();
     }
 }

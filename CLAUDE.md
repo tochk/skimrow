@@ -305,6 +305,12 @@ The WSL host can run Windows exes directly:
   (same id → its tabs/scratch stay; list order kept), refuses another entry's name, and a
   rename moves the keychain password to the new name off the UI thread (`store_entry`; a
   reconnect waits for that read). Form + list buttons are right-aligned (Cancel, then primary).
+  **Test** (left of them, `conn.rs::test_connection`) checks the form as Save does
+  (`read_form`, shared), then `DbHandle::test`: ONE connection (SSH tunnel + setup included)
+  asks `version()` and everything closes — no pool, nothing saved. Untyped secrets of an
+  edited entry come from its OLD name (cache, else keychain off the UI thread). Result =
+  green / red line above the buttons (`ConnForm.test`); `test_gen` drops a late answer after
+  a refill or re-test. `Unserved::pass_tests` / `fail_all` answer it in UI tests.
 - gpui-component element is `Input` (not TextInput); `.primary()/.danger()` need
   `ButtonVariants`; `cx.theme()` needs `ActiveTheme`; weak self-handle =
   `cx.weak_entity()`.

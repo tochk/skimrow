@@ -143,3 +143,19 @@ async fn error_surfaces_with_sqlstate() {
         other => panic!("expected Postgres error, got {other:?}"),
     }
 }
+
+/// `test` reports the server version, and an error for a database that
+/// isn't there.
+#[tokio::test]
+async fn test_reports_version() {
+    let Some(cfg) = test_config() else {
+        eprintln!("skipping: SKIMROW_TEST_* not set");
+        return;
+    };
+    let db = DbHandle::spawn();
+    let version = db.test(cfg.clone()).await.expect("test");
+    assert!(version.starts_with("PostgreSQL "), "version: {version}");
+    let mut bad = cfg;
+    bad.dbname = "skimrow_no_such_database".into();
+    assert!(db.test(bad).await.is_err());
+}

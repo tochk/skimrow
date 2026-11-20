@@ -1755,6 +1755,38 @@ impl Workspace {
                 .loading(self.form.applying)
                 .disabled(self.form.applying)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_connection(cx)));
+            let test = Button::new("test-conn")
+                .label("Test")
+                .loading(self.form.testing)
+                .disabled(self.form.testing)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.test_connection(cx)));
+            // How the last Test went: green with the server version, or red.
+            let test_line = self.form.test.clone().map(|res| {
+                let (ok, text) = match res {
+                    Ok(version) if version.is_empty() => (true, "Connection OK".to_string()),
+                    Ok(version) => (true, format!("Connection OK — {version}")),
+                    Err(e) => (false, format!("Connection failed: {e}")),
+                };
+                let color = if ok { cx.theme().green } else { c.danger };
+                h_flex()
+                    .id("conn-test-result")
+                    .pl(label_w + px(8.))
+                    .gap_1()
+                    .items_start()
+                    .text_xs()
+                    .text_color(color)
+                    .child(
+                        Icon::empty()
+                            .path(if ok {
+                                "icons/check.svg"
+                            } else {
+                                "icons/close.svg"
+                            })
+                            .xsmall()
+                            .text_color(color),
+                    )
+                    .child(div().flex_1().min_w(px(0.)).child(text))
+            });
             let cancel = Button::new("cancel-conn")
                 .label("Cancel")
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_conn_form(cx)));
@@ -1890,11 +1922,13 @@ impl Workspace {
                                 .text_color(c.danger)
                                 .child(e)
                         }))
+                        .children(test_line)
                         .child(
                             h_flex()
                                 .pt_1()
                                 .gap_2()
-                                .justify_end()
+                                .child(test)
+                                .child(div().flex_1())
                                 .child(cancel)
                                 .child(save),
                         ),

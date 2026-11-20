@@ -189,6 +189,10 @@ enum Command {
     Disconnect {
         conn: ConnId,
     },
+    Test {
+        cfg: Box<ConnectionConfig>,
+        reply: oneshot::Sender<Result<String, DbError>>,
+    },
     /// A pooled connection finished dialing (internal), for setup `gen`.
     Dialed {
         conn: ConnId,
@@ -560,11 +564,28 @@ impl Unserved {
         self.fail_all(DbError::Connect("refused".into()));
     }
 
-    /// Fail every connect sent so far with `err`, and drop the other requests.
+    /// Fail every connect and connection test sent so far with `err`, and
+    /// drop the other requests.
     pub fn fail_all(&mut self, err: DbError) {
         while let Ok(command) = self.0.try_recv() {
-            if let Command::Connect { reply, .. } = command {
-                let _ = reply.send(Err(err.clone()));
+            match command {
+                Command::Connect { reply, .. } => {
+                    let _ = reply.send(Err(err.clone()));
+                }
+                Command::Test { reply, .. } => {
+                    let _ = reply.send(Err(err.clone()));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Answer every connection test sent so far as a server of `version`
+    /// would, and drop the other requests.
+    pub fn pass_tests(&mut self, version: &str) {
+        while let Ok(command) = self.0.try_recv() {
+            if let Command::Test { reply, .. } = command {
+                let _ = reply.send(Ok(version.to_string()));
             }
         }
     }
@@ -660,6 +681,20 @@ impl DbHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Command::SetSetup { conn, setup, reply })
+            .map_err(|_| DbError::WorkerGone)?;
+        rx.await.map_err(|_| DbError::WorkerGone)?
+    }
+
+    /// Try `cfg` out without keeping anything open: one connection (through
+    /// its SSH tunnel, if it has one) with its setup, asked for the server's
+    /// `version()`, then closed.
+    pub async fn test(&self, cfg: ConnectionConfig) -> Result<String, DbError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Test {
+                cfg: Box::new(cfg),
+                reply,
+            })
             .map_err(|_| DbError::WorkerGone)?;
         rx.await.map_err(|_| DbError::WorkerGone)?
     }
@@ -1149,6 +1184,13 @@ async fn worker(tx: mpsc::UnboundedSender<Command>, mut rx: mpsc::UnboundedRecei
                 }
                 None
             }
+            Command::Test { cfg, reply } => {
+                // Off the worker loop: a slow server mustn't hold up the pools.
+                tokio::spawn(async move {
+                    let _ = reply.send(test_connection(&cfg).await);
+                });
+                None
+            }
             Command::SetupDialed {
                 conn,
                 cfg,
@@ -1351,9 +1393,14 @@ async fn dial(
         // A tunnel that couldn't carry the connection knows why; the
         // client only saw its socket close.
         .map_err(|e| {
-            tunnel
-                .and_then(Tunnel::failure)
-                .unwrap_or_else(|| DbError::Connect(e.to_string()))
+            tunnel.and_then(Tunnel::failure).unwrap_or_else(|| {
+                // The server's own reason (bad password, no such
+                // database…), not tokio-postgres's bare "db error".
+                DbError::Connect(match e.as_db_error() {
+                    Some(db) => db.message().to_string(),
+                    None => e.to_string(),
+                })
+            })
         })?;
     // The connection future drives the protocol and must be polled for the
     // client to work; it resolves when the connection closes.
@@ -1362,6 +1409,27 @@ async fn dial(
     });
     init_session(&client, cfg).await?;
     Ok(client)
+}
+
+/// [`DbHandle::test`]: dial once, read the server version, close it all.
+async fn test_connection(cfg: &ConnectionConfig) -> Result<String, DbError> {
+    let connector = make_connector(cfg)?;
+    let tunnel = match &cfg.ssh {
+        Some(ssh) => Some(Tunnel::open(ssh.clone(), cfg.host.clone(), cfg.port).await?),
+        None => None,
+    };
+    let client = dial(cfg, &connector, tunnel.as_ref()).await?;
+    let rows = client
+        .simple_query("SELECT version()")
+        .await
+        .map_err(|e| DbError::from_pg(&e))?;
+    Ok(rows
+        .iter()
+        .find_map(|m| match m {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+            _ => None,
+        })
+        .unwrap_or_default())
 }
 
 /// Run the setup's init SQL (if any) on a fresh or just-reset connection.
