@@ -399,6 +399,31 @@ pub(crate) fn rel_icon(kind: RelationKind) -> &'static str {
     }
 }
 
+/// How long a wait goes unlabelled: its loader is a bare spinner until then.
+pub(crate) const LABEL_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A slow wait's loader label — `"Running query · 12s"` — once
+/// `LABEL_AFTER` has passed; `None` before.
+pub(crate) fn wait_label(what: &str, elapsed: std::time::Duration) -> Option<String> {
+    (elapsed >= LABEL_AFTER).then(|| format!("{what} · {}s", elapsed.as_secs()))
+}
+
+/// The values Settings' connect-timeout stepper walks through (seconds;
+/// 0 = no limit).
+pub(crate) const CONNECT_TIMEOUT_STEPS: &[u64] = &[0, 5, 10, 15, 30, 60, 120, 300, 600];
+
+/// The stepper's neighbours of `secs` (which a hand-edited settings.json may
+/// have put between steps): the step below and the step above, if any.
+pub(crate) fn timeout_steps(secs: u64) -> (Option<u64>, Option<u64>) {
+    let less = CONNECT_TIMEOUT_STEPS
+        .iter()
+        .rev()
+        .find(|&&s| s < secs)
+        .copied();
+    let more = CONNECT_TIMEOUT_STEPS.iter().find(|&&s| s > secs).copied();
+    (less, more)
+}
+
 #[cfg(test)]
 mod error_span_tests {
     use super::*;
@@ -437,6 +462,32 @@ mod tests {
     use super::*;
     use gpui_component::table::ColumnSort;
     use skimrow_db::SslMode;
+
+    #[test]
+    fn wait_label_appears_after_five_seconds() {
+        use std::time::Duration;
+        assert_eq!(
+            wait_label("Running query", Duration::from_millis(4999)),
+            None
+        );
+        assert_eq!(
+            wait_label("Running query", Duration::from_millis(5000)).as_deref(),
+            Some("Running query · 5s")
+        );
+        assert_eq!(
+            wait_label("Connecting to prod", Duration::from_secs(72)).as_deref(),
+            Some("Connecting to prod · 72s")
+        );
+    }
+
+    #[test]
+    fn timeout_stepper_walks_the_steps() {
+        assert_eq!(timeout_steps(0), (None, Some(5)));
+        assert_eq!(timeout_steps(30), (Some(15), Some(60)));
+        assert_eq!(timeout_steps(600), (Some(300), None));
+        // Hand-edited between two steps: its neighbours.
+        assert_eq!(timeout_steps(45), (Some(30), Some(60)));
+    }
 
     #[test]
     fn format_keeps_the_blank_lines_between_statements() {

@@ -17,6 +17,7 @@ use gpui_component::{
 use skimrow_db::{CellValue, DbError, DbHandle, EditTarget, RowEdit, Session};
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::time::Instant;
 
 use super::colors::{palette, Colors};
 use super::session;
@@ -624,6 +625,12 @@ pub(crate) struct Tab {
     pub(crate) edited_cells: HashSet<(usize, usize)>,
 
     pub(crate) running: bool,
+    /// What the run waits for, and since when (the loader's label).
+    pub(crate) busy: Busy,
+    pub(crate) busy_since: Instant,
+    /// The batch an Apply is sending (a copy): Stop puts it back as staged
+    /// at once.
+    pub(crate) applying: Option<Vec<RowEdit>>,
     /// Bumped by every run (and by Stop): a result that comes back for an
     /// older one is stale and dropped.
     pub(crate) run_gen: u64,
@@ -719,6 +726,31 @@ pub(crate) const EDITOR_SPLIT: f32 = 0.5;
 
 /// A tab's share above the value pane when it first opens.
 pub(crate) const VALUE_SPLIT: f32 = 0.6;
+
+/// What a running tab is waiting for — its loader's label once slow.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Busy {
+    Running,
+    Explaining,
+    Counting,
+    /// A Table tab's first query: looking up its primary key, then its rows.
+    LoadingTable,
+    /// Sending `n` staged changes.
+    Applying(usize),
+}
+
+impl Busy {
+    pub(crate) fn label(self) -> String {
+        match self {
+            Busy::Running => "Running query".into(),
+            Busy::Explaining => "Explaining".into(),
+            Busy::Counting => "Counting rows".into(),
+            Busy::LoadingTable => "Loading table".into(),
+            Busy::Applying(1) => "Applying 1 change".into(),
+            Busy::Applying(n) => format!("Applying {n} changes"),
+        }
+    }
+}
 
 /// The loader over a tab's results while it runs.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -913,6 +945,9 @@ impl Tab {
             pending: Vec::new(),
             edited_cells: HashSet::new(),
             running: false,
+            busy: Busy::Running,
+            busy_since: Instant::now(),
+            applying: None,
             run_gen: 0,
             db_session: None,
             in_transaction: false,

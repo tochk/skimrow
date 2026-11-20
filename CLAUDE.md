@@ -19,8 +19,10 @@ crates/
                below). Auto-reconnect: dead pooled connections are dropped and
                redialed; a job whose SUBMIT hit a silently-dead socket retries
                once on a fresh one (safe — nothing reached the server;
-               mid-stream failures never retry). 10s connect_timeout + 120s
-               keepalive in config.rs.
+               mid-stream failures never retry). 10s TCP connect_timeout + 120s
+               keepalive in config.rs; the WHOLE dial (SSH tunnel, TCP, TLS,
+               login, init SQL) is capped by `ConnectionConfig.connect_timeout`
+               (Settings, default 30s → `DbError::Timeout`). See "Slow networks".
   skimrow-config/  JSON settings (connections, theme, keymap) + OS-keychain passwords
                (secret.rs, keyring; per-OS backend).
   skimrow-app/     gpui app (bin `skimrow`): workspace/ (the UI — ONE `Workspace` gpui
@@ -226,8 +228,11 @@ The WSL host can run Windows exes directly:
     `colors.rs::change_theme` (ALWAYS use it, not `Theme::change`) keeps the old chrome and
     zebra rows; pane / toolbar Buttons are `.ghost()`.
   - **The test scheduler rejects wakeups from other threads** (it aborts the test process).
-    UI tests use `DbHandle::idle()`, or `unserved()` + `refuse_all()` to answer on the test's
-    own thread; never `DbHandle::spawn()`, and no reader thread that hits EOF.
+    UI tests use `DbHandle::idle()`, or `unserved()` + its helpers to answer on the test's
+    own thread (`refuse_all` / `fail_all` / `accept_connects` / `report_phase` /
+    `pending_jobs` / `fail_jobs` / `answer_applies`; the ones that look without answering
+    keep the requests in `Unserved.held`); never `DbHandle::spawn()`, and no reader thread
+    that hits EOF. `test_support::unserved_workspace` builds one.
 - Driving the app on WSL X11: stop it with `pkill -x skimrow` — `pkill -f target/debug/skimrow`
   matches (and kills) the shell running the command. `import -window` silently crops a
   window that extends past the screen (bottom-panel UI "missing"): `xdotool windowmove`
@@ -311,6 +316,31 @@ The WSL host can run Windows exes directly:
   edited entry come from its OLD name (cache, else keychain off the UI thread). Result =
   green / red line above the buttons (`ConnForm.test`); `test_gen` drops a late answer after
   a refill or re-test. `Unserved::pass_tests` / `fail_all` answer it in UI tests.
+- **Slow networks / connecting** (`conn.rs::start_connect`, `Connecting`, `view.rs::
+  connecting_body`). A connect is `Workspace.connecting: Some(Connecting { gen, name, phase,
+  since, task })` from the click until the first schema list lands: the sidebar body shows a
+  spinner + Cancel, after 5s the PHASE + counter (`ConnPhase::{Keychain, Certificates,
+  SshTunnel, Server, Schemas}` — the worker reports the middle three through
+  `DbHandle::open_watched`'s `ConnectPhases` receiver; Keychain / Schemas are app-side), and
+  the title bar a spinner instead of the grey dot. Connected = phase `Schemas` (no Cancel);
+  `load_schemas`' result ends it. Failure / timeout / Cancel → `connect_error` in the sidebar
+  with Retry (`connect_or_refresh`) + Connections — no auto-modal (the user's call).
+  - **Latest click wins**: `start_connect` bumps `connect_gen` and REPLACES `connecting`,
+    dropping the old `task` → its future → `open_watched`'s reply receiver → the worker
+    abandons that dial. A stale result that still lands is `disconnect`ed, never applied
+    (it used to overwrite `conn` and leak the pool). `connect_done` runs inside that task, so
+    it `detach()`es it instead of dropping it.
+  - **Deadline**: `Settings.connect_timeout_secs` (default 30, 0 = none; stepper over
+    `util::CONNECT_TIMEOUT_STEPS`), set on the config by `start_connect` / `test_connection`
+    (`conn::connect_timeout`). Covers every dial — first connect, pool redials, Test, the
+    setup trial — via `actor.rs::within`; the keychain read is NOT under it (an OS unlock
+    prompt may be waiting). Applies from the next connect.
+  - Label-only Buttons show no spinner from `.loading(true)` (gpui-component only swaps an
+    EXISTING icon): the form's Test / Save get `.icon(spinner().small())` while busy.
+  - Verified on Xvfb through a Python delaying TCP proxy (1.5s per chunk) and a black-hole
+    one (accepts, never answers) — `skimrow-db/tests/connect.rs::silent_server` is the same
+    trick for the timeout / abandon / worker-not-blocked tests (no Postgres needed except
+    the last).
 - gpui-component element is `Input` (not TextInput); `.primary()/.danger()` need
   `ButtonVariants`; `cx.theme()` needs `ActiveTheme`; weak self-handle =
   `cx.weak_entity()`.
@@ -550,8 +580,18 @@ The WSL host can run Windows exes directly:
   the icon inherits the button's text color, which is what dims it when disabled — a
   fixed color made a disabled button look live.
 - **Loader** (`grid.rs::Tab::loader`, `view.rs::loading_overlay`): every run shows it from
-  the moment it starts — NO delay before it (the user's call; a 150ms one was removed). A bare
-  animated `gpui_component::spinner::Spinner` (`icons/loader-circle.svg`), no card, no text.
+  the moment it starts — NO delay before it (the user's call; a 150ms one was removed). An
+  animated spinner (`view.rs::spinner()` — ALWAYS use it: gpui-component's default
+  `IconName::Loader` svg isn't bundled, so a bare `Spinner::new()` is blank), no card. After
+  `util::LABEL_AFTER` (5s, the user's call) a label with a ticking counter appears under it,
+  `"Running query · 12s"` (`util::wait_label`; the text is `Tab.busy` — `grid::Busy::{Running,
+  Explaining, Counting, LoadingTable, Applying(n)}`, set by `begin_run(tab, busy)` — counted
+  from `Tab.busy_since`). Multi-step waits (pk lookup → rows, count → last page, apply →
+  reload) go through `query.rs::chain_run`, which keeps the first step's `busy_since` so the
+  counter doesn't restart. The counters repaint via the spinners' animation frames, plus
+  `mod.rs::tick_wait_labels` (1s timer while `waiting()`) for when the OS asks for reduced
+  motion (gpui's Spinner then requests no frames). A running tab's CHIP shows a small spinner
+  in place of its kind icon (no label there).
   No rows yet → on an OPAQUE pane (`Loader::Blank`); rows/plan from before → over them,
   dimmed (`OverData`). A click on it asks "Cancel the running query?"
   (`Modal::ConfirmCancel(tab_id)` → `confirm_cancel` → `cancel_tab`); `render` drops that
@@ -561,7 +601,18 @@ The WSL host can run Windows exes directly:
   `occlude()`d child of a `relative` wrapper around grid|plan (the Table stays mounted
   underneath — focus/element state intact), so no click/hover/wheel reaches the grid; keys
   are blocked by `tab.running` guards in `grid_motion` and `begin_edit_with`, and +/- are
-  disabled while running.
+  disabled while running. **No second run while one is on** (the user's call — it would only
+  queue behind the first on the tab's connection): `query.rs::refuse_if_running` guards the
+  USER entry points (`run_active_tab` / Ctrl+Enter, `explain_active`, `reload_data`,
+  `apply_where` (filter Enter / ×), `toggle_sort`, `go_page`, `cancel_pending`) with a status
+  hint ("Query running — Stop it first"); Refresh / Explain buttons are disabled. NOT in
+  `begin_run`: `with_table_pk` → `start_query` and Apply → reload chain through it.
+  **Apply locks the tab like a run** (`edit.rs::apply_pending`: `Busy::Applying(n)`, OverData
+  loader, editing / +/- / Apply / Revert locked). `Tab.applying` keeps a copy of the batch:
+  Stop (`cancel_tab`) stages it again AT ONCE (the cancel rolls the transaction back); a late
+  `Ok` after Stop (the COMMIT beat the cancel) clears the staged edits and reloads — applied
+  edits must never stay staged to be sent twice. The cancel dialog words itself per kind
+  ("Stop applying the changes?") and shares `confirm_query_cancel`.
 - **Status bar + collapsible bottom panels** (`view.rs::render_status_bar`, Zed-style): ghost
   icon toggles (`.selected` + a `theme.blue` icon while open) for QUERY LOG / MESSAGES, persisted as
   `Settings.show_query_log` / `show_messages` (also in the palette), and TERMINAL (not
@@ -701,10 +752,14 @@ The WSL host can run Windows exes directly:
     has landed — Postgres applies a cancel to whatever the backend runs when it arrives
     (ignored while idle), so a late one would hit the next borrower.
   - The worker loop alone owns every pool (no locks): jobs report back through its own
-    sender (`Command::JobDone` / `Dialed`). Dial failure fails the first waiting job, or
+    sender (`Command::JobDone` / `Dialed` / `Opened`). **Nothing slow runs ON the loop**:
+    `Connect` is spawned (like `Test` / `SetSetup`) and reports back as `Opened` — awaiting it
+    inline used to stall every other command, Stop included, for as long as a slow server
+    took. The spawned connect `select!`s on `reply.closed()`, so dropping `open`'s future
+    abandons the dial; an `Opened` whose caller left is dropped (closes it). Dial failure fails the first waiting job, or
     all of them when no live connection could come back. The TLS connector is built once
-    per connection and reused by every dial and cancel (verifying modes load the OS trust
-    store — slow on Windows).
+    per connection (on `spawn_blocking`, `actor.rs::connector_for`) and reused by every dial
+    and cancel (verifying modes load the OS trust store — slow on Windows).
   - **Connection setup** is PER CONNECTION (`ConnectionEntry.params` lines + `init_sql`,
     edited in the connection form; `skimrow_db::ConnSetup`, carried on `ConnectionConfig.setup`;
     the env connection has none). Params: libpq client keys (`application_name`,
@@ -759,7 +814,9 @@ The WSL host can run Windows exes directly:
     flushes on connection switch and both window-close paths. `last_saved` skips
     writes that would change nothing.
   - **Scratch is per connection** (`<config>/skimrow/scratch/<conn id>.sql`), always
-    saved regardless of the checkbox. The global `scratch.sql` remains the scratch
+    saved regardless of the checkbox — on every keystroke, by ONE writer thread
+    (`store::scratch_writer`, coalesces a burst to its latest text per file; keeps the disk
+    off the UI thread). Both window-close paths call `store::flush_scratch` (waits ≤2s). The global `scratch.sql` remains the scratch
     for the not-connected state and seeds a connection that has none yet.
     `Tab::scratch` captures its key at creation — safe because every tab is closed
     on a connection switch.
@@ -906,7 +963,11 @@ The WSL host can run Windows exes directly:
     = the default), ▾ of `shell_choices()` (/etc/shells; pwsh/powershell/cmd/wsl/Git Bash on
     Windows; the first = default and picking it EMPTIES the field), Browse (folder icon,
     `prompt_for_paths`). Picks land in `pending_shell` → `render` sets the input (needs the
-    window) → its Change saves. Applies to the next terminal started.
+    window) → its Change saves. Applies to the next terminal started. `default_shell()` /
+    `shell_choices()` scan PATH (`is_file` per dir — a dead mapped drive / UNC entry stalls
+    each check on Windows), so `Workspace::new` runs them on `background_spawn`; the results
+    land in `Workspace.default_shell` / `shell_choices` and `flush_pending_shell` sets the
+    placeholder (`InputState::set_placeholder`). `open_terminal` passes the found default.
   - **Exit**: a thread `child.wait()`s and resolves a oneshot → `terminal_exited(gen)` drops
     it (`terminal_gen` ignores a replaced one). Needed because on Windows ConPTY's output
     pipe does NOT hit EOF when the shell exits (only when the console is closed), so the
@@ -952,8 +1013,17 @@ The WSL host can run Windows exes directly:
     toggles. There is no toggle callback; `cx.observe(&tree_state, on_tree_notify)` fires on
     every select/toggle (they all notify) and `sync_expansion` diffs retained items into
     `expanded_ids`, kicking loads. The observer NEVER calls `set_items` (no rebuild loop).
-  - **Unloaded expandables get a disabled "loading…" placeholder child** (`is_folder()` ==
-    `children.len()>0`, so without one the widget won't expand them).
+  - **Unloaded expandables get a disabled "loading…" child** (`NodeMeta::Loading`, drawn with a
+    spinner; `is_folder()` == `children.len()>0`, so without one the widget won't expand them).
+    `tree.rs::pending_item` makes it — or, once the load FAILED, an error row
+    (`NodeMeta::Failed { retry: TreeLoad, message }`, "Failed to load — retry", tooltip = the
+    error; click / Enter → `retry_tree_load`). `SchemaTree.failed` (node id → error; `db` =
+    the schema list) is what stops the old hot loop: an error used to drop the in-flight id
+    and `sync_tree` → `ensure_loads` re-fired at once, forever. `ensure_loads` skips failed
+    ids; an explicit load (error row, a schema's Refresh, global Refresh = clears all) retries.
+    Load results for a connection that's been replaced are ignored (`this.conn != Some(conn)`).
+    `load_schemas` runs one at a time (`schemas_loading`; the sidebar Refresh button spins);
+    a loaded schema being refreshed shows a spinner in place of its chevron.
   - **Two click targets kept**: the widget's row handler is `on_mouse_down` (not click) —
     the relation name area has its own `on_mouse_down` that `cx.stop_propagation()`s, selects
     manually, and opens via `click_tree_relation`: like Zed's project panel, one click opens
@@ -1025,6 +1095,12 @@ The WSL host can run Windows exes directly:
   - `LspSlot = Rc<RefCell<Option<LspHandle>>>` on `Workspace`, shared into every editor's
     provider; `start_lsp` fills it on connect (and switch), `None` = no completion (degrades
     silently). sqls opens its **own** Postgres connection to introspect (a 2nd connection).
+  - **Writes never block the UI thread**: a writer thread owns sqls' stdin and `Inner::send`
+    just queues the framed message (`mpsc`). sqls stops reading stdin while it introspects
+    (over a slow link that's long); the old blocking `write!` then froze the UI on the next
+    keystroke once the ~64KiB pipe filled (every keystroke sends the whole document). Also
+    `start_lsp` finds + spawns sqls on `background_spawn`; `lsp_gen` drops a server started
+    for a connection that's been replaced meanwhile.
   - **Hide the console**: sqls is a console subprocess; spawn sets `CREATE_NO_WINDOW`
     (`0x0800_0000`) via `creation_flags` on Windows, else a console window pops next to the app.
   - **Insertion fix (dup/eaten chars)**: sqls returns bare `label`s (no `insertText`/`textEdit`),

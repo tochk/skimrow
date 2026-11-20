@@ -22,10 +22,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -70,7 +70,11 @@ pub struct LspHandle {
 }
 
 struct Inner {
-    stdin: Mutex<ChildStdin>,
+    /// Framed messages for the writer thread, which owns the server's stdin.
+    /// Sending never blocks: a server busy introspecting over a slow link
+    /// stops reading its stdin, and a blocking write here would freeze the UI
+    /// thread (every keystroke sends the document) once the pipe filled up.
+    outbox: Mutex<mpsc::Sender<Vec<u8>>>,
     child: Mutex<Child>,
     next_id: AtomicI64,
     version: AtomicI64,
@@ -83,11 +87,67 @@ struct Inner {
 }
 
 impl Inner {
+    /// Take over a just-spawned server: its writer and reader threads.
+    fn start(
+        mut child: Child,
+        config_path: PathBuf,
+        generation: u64,
+    ) -> std::io::Result<Arc<Inner>> {
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (outbox, outgoing) = mpsc::channel();
+        if let Err(e) = thread::Builder::new()
+            .name("skimrow-lsp-writer".into())
+            .spawn(move || writer_loop(stdin, outgoing))
+        {
+            let _ = child.kill();
+            return Err(e);
+        }
+        let inner = Arc::new(Inner {
+            outbox: Mutex::new(outbox),
+            child: Mutex::new(child),
+            next_id: AtomicI64::new(1),
+            version: AtomicI64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            config_path,
+            dead: AtomicBool::new(false),
+            started: Instant::now(),
+            generation,
+        });
+        // The reader holds only a Weak ref so it never keeps the process alive:
+        // when the last handle drops, Inner::drop kills the child, stdout hits
+        // EOF, and the reader returns.
+        let weak = Arc::downgrade(&inner);
+        thread::Builder::new()
+            .name("skimrow-lsp-reader".into())
+            .spawn(move || reader_loop(BufReader::new(stdout), weak))
+            .ok();
+        Ok(inner)
+    }
+
     fn send(&self, msg: Value) {
-        let body = msg.to_string();
-        if let Ok(mut w) = self.stdin.lock() {
-            let _ = write!(w, "Content-Length: {}\r\n\r\n{}", body.len(), body);
-            let _ = w.flush();
+        if let Ok(outbox) = self.outbox.lock() {
+            let _ = outbox.send(frame(&msg));
+        }
+    }
+}
+
+/// `msg` as LSP puts it on the wire.
+fn frame(msg: &Value) -> Vec<u8> {
+    let body = msg.to_string();
+    format!("Content-Length: {}\r\n\r\n{}", body.len(), body).into_bytes()
+}
+
+/// The writer thread: feeds the server's stdin. Ends when the handle is gone
+/// (the outbox closes; dropping stdin closes the pipe) or the server is.
+fn writer_loop(mut stdin: impl Write, outbox: mpsc::Receiver<Vec<u8>>) {
+    while let Ok(bytes) = outbox.recv() {
+        if stdin
+            .write_all(&bytes)
+            .and_then(|()| stdin.flush())
+            .is_err()
+        {
+            return;
         }
     }
 }
@@ -125,30 +185,9 @@ impl LspHandle {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-
-        let inner = Arc::new(Inner {
-            stdin: Mutex::new(stdin),
-            child: Mutex::new(child),
-            next_id: AtomicI64::new(1),
-            version: AtomicI64::new(1),
-            pending: Mutex::new(HashMap::new()),
-            config_path,
-            dead: AtomicBool::new(false),
-            started: Instant::now(),
-            generation,
-        });
-
-        // The reader holds only a Weak ref so it never keeps the process alive:
-        // when the last handle drops, Inner::drop kills the child, stdout hits
-        // EOF, and the reader returns.
-        let weak = Arc::downgrade(&inner);
-        thread::Builder::new()
-            .name("skimrow-lsp-reader".into())
-            .spawn(move || reader_loop(BufReader::new(stdout), weak))
-            .ok();
+        let child = cmd.spawn()?;
+        let inner = Inner::start(child, config_path.clone(), generation)
+            .inspect_err(|_| drop(std::fs::remove_file(&config_path)))?;
 
         let handle = LspHandle {
             inner,
@@ -593,6 +632,32 @@ impl CompletionProvider for SqlCompletion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that never reads its stdin (sqls busy introspecting over a
+    /// slow link) doesn't hold up the caller: far more than a pipe buffer's
+    /// worth of messages goes out at once.
+    #[cfg(unix)]
+    #[test]
+    fn send_never_blocks_on_a_server_that_does_not_read() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let path = std::env::temp_dir().join("skimrow-lsp-send-test.yml");
+        let inner = Inner::start(child, path, 0).expect("start");
+        let text = "x".repeat(64 * 1024);
+        let started = Instant::now();
+        for _ in 0..64 {
+            inner.send(json!({"jsonrpc": "2.0", "method": "textDocument/didChange",
+                "params": {"contentChanges": [{"text": text}]}}));
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "send blocked on the pipe"
+        );
+    }
 
     /// End-to-end: spawn the real `sqls` against the local Postgres, sync a doc,
     /// and confirm `textDocument/completion` returns items. Gated on the sqls

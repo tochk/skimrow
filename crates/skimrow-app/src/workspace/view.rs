@@ -29,6 +29,16 @@ const LOG_W: gpui::Pixels = px(520.);
 /// The query log's / Messages' width beside the terminal.
 const SIDE_W: gpui::Pixels = px(360.);
 
+/// The app's loading spinner (gpui-component's default icon isn't bundled).
+pub(super) fn spinner() -> Spinner {
+    Spinner::new().icon(Icon::empty().path("icons/loader-circle.svg"))
+}
+
+/// A spinner's icon for `Button::loading_icon`.
+fn loader_icon() -> Icon {
+    Icon::empty().path("icons/loader-circle.svg")
+}
+
 impl Workspace {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
@@ -74,6 +84,8 @@ impl Workspace {
                     .ghost()
                     .tab_stop(false)
                     .icon(Icon::empty().path("icons/refresh-cw.svg"))
+                    .loading(self.tree.schemas_loading)
+                    .loading_icon(loader_icon())
                     .tooltip("Refresh schemas")
                     .on_click(
                         cx.listener(|this, _: &ClickEvent, _, cx| this.connect_or_refresh(cx)),
@@ -119,7 +131,9 @@ impl Workspace {
                 )
         });
 
-        let body: AnyElement = if connected {
+        let body: AnyElement = if let Some(connecting) = &self.connecting {
+            self.connecting_body(connecting, c, cx).into_any_element()
+        } else if connected {
             let weak = cx.weak_entity();
             div()
                 .flex_grow(1.)
@@ -141,12 +155,45 @@ impl Workspace {
                 ))
                 .into_any_element()
         } else {
-            div()
+            let mut body = v_flex()
                 .p_3()
-                .text_sm()
-                .text_color(c.fg_dim)
-                .child("Not connected")
-                .into_any_element()
+                .gap_2()
+                .child(div().text_sm().text_color(c.fg_dim).child("Not connected"));
+            // Why the last connect didn't happen, and another go at it.
+            if let Some(error) = &self.connect_error {
+                body = body
+                    .child(
+                        div()
+                            .id("connect-error")
+                            .text_xs()
+                            .text_color(c.danger)
+                            .child(error.clone()),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("connect-retry")
+                                    .small()
+                                    .tab_stop(false)
+                                    .label("Retry")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.connect_or_refresh(cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("connect-list")
+                                    .small()
+                                    .ghost()
+                                    .tab_stop(false)
+                                    .label("Connections")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.toggle_connections(cx)
+                                    })),
+                            ),
+                    );
+            }
+            body.into_any_element()
         };
 
         v_flex()
@@ -157,6 +204,44 @@ impl Workspace {
             .child(header)
             .children(filter)
             .child(body)
+    }
+
+    /// The sidebar while a connect is on: a spinner, what it's doing once that
+    /// takes a while (`LABEL_AFTER`), and Cancel until it's connected.
+    fn connecting_body(
+        &self,
+        connecting: &conn::Connecting,
+        c: Colors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .id("connecting")
+            .p_3()
+            .pt(px(24.))
+            .gap_2()
+            .items_center()
+            .child(spinner().color(c.fg_dim))
+            .children(
+                util::wait_label(&connecting.label(), connecting.since.elapsed()).map(|text| {
+                    div()
+                        .text_sm()
+                        .text_color(c.fg_dim)
+                        .text_center()
+                        .child(text)
+                }),
+            )
+            .when(!connecting.connected(), |this| {
+                this.child(
+                    Button::new("connect-cancel")
+                        .small()
+                        .ghost()
+                        .tab_stop(false)
+                        .label("Cancel")
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_connect(cx)),
+                        ),
+                )
+            })
     }
 
     fn render_center(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -218,7 +303,13 @@ impl Workspace {
                 .text_sm()
                 .text_color(tint)
                 .when(!is_active, |d| d.hover(|s| s.bg(c.hover)))
-                .child(tree_icon(kind_icon, tint))
+                // Waiting on the database (any tab, shown or not): a spinner
+                // in place of its kind icon.
+                .child(if tab.running {
+                    spinner().color(tint).small().into_any_element()
+                } else {
+                    tree_icon(kind_icon, tint).into_any_element()
+                })
                 .child(div().max_w(px(160.)).truncate().child(tab.title.clone()))
                 // Inside a transaction (see the toolbar badge).
                 .when(tab.in_transaction, |d| {
@@ -456,7 +547,7 @@ impl Workspace {
                     .tab_stop(false)
                     .icon(Icon::empty().path("icons/refresh-cw.svg"))
                     .tooltip("Refresh data")
-                    .disabled(tab.base_sql.is_none())
+                    .disabled(tab.base_sql.is_none() || tab.running)
                     .on_click(
                         cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.reload_data(tab_id, cx)
@@ -489,7 +580,7 @@ impl Workspace {
                     "explain",
                     "icons/list-tree.svg",
                     "Explain — query plan (click again to close)",
-                    has_sql,
+                    has_sql && !tab.running,
                 )
                 .selected(explained(false))
                 .on_click(
@@ -501,7 +592,7 @@ impl Workspace {
                     "explain-analyze",
                     "icons/gauge.svg",
                     "Explain Analyze — runs the query, plan with real timings",
-                    has_sql,
+                    has_sql && !tab.running,
                 )
                 .selected(explained(true))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.explain_active(true, cx))),
@@ -618,12 +709,13 @@ impl Workspace {
                 .into_any_element()
         };
         let loader = tab.loader();
+        let label = util::wait_label(&tab.busy.label(), tab.busy_since.elapsed());
         results = results.child(
             fill(v_flex())
                 .relative()
                 .overflow_hidden()
                 .child(shown)
-                .children(loader.map(|l| Self::loading_overlay(tab_id, l, c, cx))),
+                .children(loader.map(|l| Self::loading_overlay(tab_id, l, label, c, cx))),
         );
 
         // Table tabs hide the redundant generated `SELECT *` editor and let the
@@ -740,6 +832,7 @@ impl Workspace {
     fn loading_overlay(
         tab_id: u64,
         loader: Loader,
+        label: Option<String>,
         c: Colors,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -754,15 +847,20 @@ impl Workspace {
             .occlude()
             .bg(backdrop)
             .flex()
+            .flex_col()
+            .gap_2()
             .items_center()
             .justify_center()
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.ask_cancel(tab_id, cx)))
-            .child(
-                Spinner::new()
-                    .icon(Icon::empty().path("icons/loader-circle.svg"))
-                    .color(c.fg_dim)
-                    .large(),
-            )
+            .child(spinner().color(c.fg_dim).large())
+            // What it's waiting for, once that takes a while.
+            .children(label.map(|text| {
+                div()
+                    .debug_selector(|| "loader-label".into())
+                    .text_sm()
+                    .text_color(c.fg_dim)
+                    .child(text)
+            }))
     }
 
     /// "Cancel the running query?" — asked by a click on a tab's loader.
@@ -772,6 +870,22 @@ impl Workspace {
             .tab(tab_id)
             .map(|t| t.title.clone())
             .unwrap_or_default();
+        let applying = self
+            .tab(tab_id)
+            .is_some_and(|t| matches!(t.busy, Busy::Applying(_)));
+        let (question, detail, confirm) = if applying {
+            (
+                "Stop applying the changes?".to_string(),
+                "Nothing will be saved; the changes stay staged.".to_string(),
+                "Stop applying",
+            )
+        } else {
+            (
+                "Cancel the running query?".to_string(),
+                format!("“{title}” is still waiting for the database."),
+                "Cancel query",
+            )
+        };
         let body =
             v_flex()
                 .p_4()
@@ -781,14 +895,9 @@ impl Workspace {
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(c.fg)
-                        .child("Cancel the running query?"),
+                        .child(question),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(c.fg_dim)
-                        .child(format!("“{title}” is still waiting for the database.")),
-                )
+                .child(div().text_xs().text_color(c.fg_dim).child(detail))
                 .child(
                     h_flex()
                         .pt_1()
@@ -810,7 +919,7 @@ impl Workspace {
                         ))
                         .child(
                             Button::new("confirm-cancel")
-                                .label("Cancel query")
+                                .label(confirm)
                                 .danger()
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.confirm_cancel(tab_id, cx)
@@ -1752,12 +1861,13 @@ impl Workspace {
             let save = Button::new("save-conn")
                 .label(if editing { "Save" } else { "Save & Connect" })
                 .primary()
-                .loading(self.form.applying)
+                // A label-only button shows no spinner of its own.
+                .when(self.form.applying, |b| b.icon(spinner().small()))
                 .disabled(self.form.applying)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_connection(cx)));
             let test = Button::new("test-conn")
                 .label("Test")
-                .loading(self.form.testing)
+                .when(self.form.testing, |b| b.icon(spinner().small()))
                 .disabled(self.form.testing)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.test_connection(cx)));
             // How the last Test went: green with the server version, or red.
@@ -2139,6 +2249,10 @@ impl Workspace {
                 "Connections per database",
                 self.render_pool_size(c, cx).into_any_element(),
             ))
+            .child(setting_row(
+                "Connect timeout",
+                self.render_connect_timeout(c, cx).into_any_element(),
+            ))
             .child(self.render_shell_setting(c, cx))
             // macOS copies and pastes with Cmd; Ctrl+C / Ctrl+V are the shell's.
             .when(!cfg!(target_os = "macos"), |d| {
@@ -2343,6 +2457,41 @@ impl Workspace {
             ))
     }
 
+    /// Settings' connect-timeout stepper: through `util::CONNECT_TIMEOUT_STEPS`
+    /// (0 = no limit).
+    fn render_connect_timeout(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+        let n = self.settings.connect_timeout_secs;
+        let (less, more) = util::timeout_steps(n);
+        let step = |id: &'static str, icon: &'static str, to: Option<u64>| {
+            Button::new(id)
+                .small()
+                .icon(Icon::empty().path(icon))
+                .disabled(to.is_none())
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if let Some(to) = to {
+                        this.set_connect_timeout(to, cx)
+                    }
+                }))
+        };
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(step("timeout-less", "icons/minus.svg", less))
+            .child(
+                div()
+                    .w(px(64.))
+                    .text_center()
+                    .text_sm()
+                    .text_color(c.fg)
+                    .child(if n == 0 {
+                        "No limit".to_string()
+                    } else {
+                        format!("{n}s")
+                    }),
+            )
+            .child(step("timeout-more", "icons/plus.svg", more))
+    }
+
     /// The keyboard-shortcut reference (F1): every section of
     /// `keynav::SHORTCUTS`, flowed into two columns.
     fn render_shortcuts(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2470,12 +2619,15 @@ impl Workspace {
     fn render_titlebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
         let connected = self.conn.is_some();
-        let conn_name = self
-            .cfg
-            .as_ref()
-            .filter(|_| connected)
-            .map(|cfg| cfg.name.clone())
-            .unwrap_or_else(|| "Not connected".into());
+        let conn_name = match &self.connecting {
+            Some(connecting) if !connected => format!("Connecting to {}…", connecting.name),
+            _ => self
+                .cfg
+                .as_ref()
+                .filter(|_| connected)
+                .map(|cfg| cfg.name.clone())
+                .unwrap_or_else(|| "Not connected".into()),
+        };
         let dot = if connected {
             rgba(0x22c55eff)
         } else {
@@ -2510,7 +2662,11 @@ impl Workspace {
                     .child("skimrow"),
             )
             .child(div().w(px(1.)).h(px(14.)).bg(c.border))
-            .child(div().size(px(7.)).rounded_full().bg(dot))
+            .child(match self.connecting.as_ref().filter(|c| !c.connected()) {
+                // Connecting: a spinner where the dot goes, and to whom.
+                Some(_) => spinner().color(c.fg_dim).xsmall().into_any_element(),
+                None => div().size(px(7.)).rounded_full().bg(dot).into_any_element(),
+            })
             .child(div().text_xs().text_color(c.fg_dim).child(conn_name));
 
         let controls = h_flex()
@@ -2627,6 +2783,7 @@ impl Workspace {
                     // `Workspace::new` never runs — save geometry and tabs here.
                     super::save_window_geometry(window);
                     this.flush_session(cx);
+                    session::store::flush_scratch();
                     window.remove_window()
                 }
             }),
@@ -2666,6 +2823,7 @@ impl Render for Workspace {
         }
         self.load_restored_tab(cx);
         self.flush_pending_shell(window, cx);
+        self.tick_wait_labels(cx);
         self.flush_pending_key(window, cx);
         // Filter cleared from a window-less context (connection switch).
         if self.tree.pending_clear_filter {
@@ -3160,16 +3318,23 @@ fn schema_tree_row(
 ) -> ListItem {
     let c = palette(cx);
     let item = entry.item();
-    let (meta, tree_state, sel_bounds) = match weak.upgrade() {
+    let (meta, tree_state, sel_bounds, refreshing) = match weak.upgrade() {
         Some(ws) => {
             let ws = ws.read(cx);
+            let meta = ws.tree.meta.get(&item.id).cloned();
+            // A loaded schema being loaded again (its Refresh): there is no
+            // "loading…" row then, so the spinner takes the chevron's place.
+            let refreshing = ws.tree.loads.contains(&item.id)
+                && matches!(&meta, Some(NodeMeta::Schema { name })
+                    if ws.tree.schemas.iter().any(|s| &s.name == name && s.relations.is_some()));
             (
-                ws.tree.meta.get(&item.id).cloned(),
+                meta,
                 Some(ws.tree.state.clone()),
                 Some(ws.tree.sel_bounds.clone()),
+                refreshing,
             )
         }
-        None => (None, None, None),
+        None => (None, None, None, false),
     };
 
     // Continuous vertical guides: one 12px column per ancestor depth (rows are
@@ -3192,7 +3357,9 @@ fn schema_tree_row(
         .items_center()
         .gap_1p5()
         .overflow_hidden();
-    row = row.child(if entry.is_folder() {
+    row = row.child(if refreshing {
+        spinner().color(c.fg_dim).small().into_any_element()
+    } else if entry.is_folder() {
         tree_icon(chevron_icon(entry.is_expanded()), c.fg_dim).into_any_element()
     } else {
         div().w(px(14.)).flex_shrink_0().into_any_element()
@@ -3260,7 +3427,37 @@ fn schema_tree_row(
                         .child(meta.clone()),
                 )
             }),
-        // Placeholder ("loading…") or unknown: the label, dimmed by the
+        Some(NodeMeta::Loading) => row
+            .child(spinner().color(c.fg_dim).small())
+            .child(item.label.clone()),
+        // Click retries (Enter too, via `open_selected_tree_node`); hover
+        // says what went wrong.
+        Some(NodeMeta::Failed { retry, message }) => {
+            let (weak, retry, message) = (weak.clone(), retry.clone(), message.clone());
+            row.child(
+                h_flex()
+                    .id(("tree-retry", ix))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .items_center()
+                    .gap_1p5()
+                    .cursor_pointer()
+                    .text_color(c.danger)
+                    .child(tree_icon("icons/refresh-cw.svg", c.danger))
+                    .child(div().truncate().child(item.label.clone()))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(message.clone()).build(window, cx)
+                    })
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        cx.stop_propagation();
+                        let retry = retry.clone();
+                        weak.update(cx, |this, cx| this.retry_tree_load(retry, cx))
+                            .ok();
+                    }),
+            )
+        }
+        // Placeholder ("(empty)") or unknown: the label, dimmed by the
         // widget's disabled styling.
         _ => row.child(item.label.clone()),
     };

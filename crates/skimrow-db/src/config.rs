@@ -70,6 +70,11 @@ pub struct ConnectionConfig {
     /// the SSH server sees them); `None` = directly.
     #[serde(skip)]
     pub ssh: Option<SshConfig>,
+    /// Longest a connection may take to open — the SSH tunnel, TCP, TLS,
+    /// authentication and init SQL together; `None` = no limit. Every dial
+    /// of the pool is bounded by it, not just the first.
+    #[serde(skip)]
+    pub connect_timeout: Option<Duration>,
 }
 
 /// Set up every connection of a pool the same way: extra connection
@@ -229,6 +234,9 @@ fn default_port() -> u16 {
     5432
 }
 
+/// [`ConnectionConfig::connect_timeout`] of a new config.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl ConnectionConfig {
     /// Minimal config for tests / programmatic use.
     pub fn new(
@@ -248,6 +256,7 @@ impl ConnectionConfig {
             password: None,
             setup: ConnSetup::default(),
             ssh: None,
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
         }
     }
 

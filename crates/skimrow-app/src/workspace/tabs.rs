@@ -150,7 +150,7 @@ impl Workspace {
             return then(self, cx);
         }
         let (schema, table) = (schema.clone(), table.clone());
-        let Some(gen) = self.begin_run(tab_id) else {
+        let Some(gen) = self.begin_run(tab_id, Busy::LoadingTable) else {
             return;
         };
         let db = self.db.clone();
@@ -161,7 +161,12 @@ impl Workspace {
             };
             tab.running = false;
             tab.table_pk = Some(pk.unwrap_or_default());
-            then(this, cx);
+            let since = tab.busy_since;
+            this.chain_run(tab_id, since, cx, then);
+            // Still the table's first load, as far as the loader says.
+            if let Some(tab) = this.tab_mut(tab_id).filter(|t| t.running) {
+                tab.busy = Busy::LoadingTable;
+            }
         });
         cx.notify();
     }
@@ -383,6 +388,9 @@ impl Workspace {
     /// page. A hand-typed ORDER BY replaces whatever a header click had set, so
     /// the header arrows are cleared.
     pub(super) fn apply_where(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        if self.refuse_if_running(tab_id, cx) {
+            return;
+        }
         if !matches!(
             self.tab(tab_id).map(|t| &t.kind),
             Some(TabKind::Table { .. })

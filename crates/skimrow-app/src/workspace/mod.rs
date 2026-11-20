@@ -31,6 +31,7 @@ use skimrow_db::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Instant;
 
 mod autoscroll;
 pub(crate) mod colors;
@@ -50,7 +51,7 @@ mod view;
 use autoscroll::AutoScroll;
 use colors::{palette, Colors};
 use conn::ConnForm;
-use grid::{Clause, Loader, PageMove, Tab, TabKind};
+use grid::{Busy, Clause, Loader, PageMove, Tab, TabKind};
 pub use keynav::bind_nav_keys;
 use keynav::*;
 use modal::{Modal, ModalFocus};
@@ -185,6 +186,8 @@ pub struct Workspace {
     /// Running `sqls` LSP handle (schema-aware completion), filled on connect.
     /// Shared with every SQL editor's completion provider.
     lsp_slot: LspSlot,
+    /// Bumped per `start_lsp`: a server spawned for an older one is dropped.
+    lsp_gen: u64,
 
     log: QueryLog,
 
@@ -210,6 +213,11 @@ pub struct Workspace {
     shell_input: Entity<InputState>,
     shell_choices: Vec<String>,
     pending_shell: Option<String>,
+    /// The platform's default shell, once found (off the UI thread at startup:
+    /// on Windows it's a PATH scan, which a dead network drive on PATH can
+    /// stall for seconds). `render` then names it in the shell field.
+    default_shell: Option<String>,
+    shell_placeholder_due: bool,
 
     // Connections.
     settings: Settings,
@@ -220,6 +228,18 @@ pub struct Workspace {
     /// An SSH server's new host key the trust dialog asks about, and the
     /// config to connect with once it is trusted.
     host_key: Option<(skimrow_db::HostKey, ConnectionConfig)>,
+    /// The connect in flight (sidebar + title bar loader), until its schema
+    /// list is in. Dropping it abandons the connect.
+    connecting: Option<conn::Connecting>,
+    /// Bumped by every connect started or cancelled; a result for an older
+    /// one is closed again, never applied.
+    connect_gen: u64,
+    /// Why the last connect didn't happen (the sidebar shows it with Retry).
+    connect_error: Option<String>,
+    /// A once-a-second repaint is scheduled while something waits on the
+    /// database, so the loaders' elapsed counters move even when the spinners
+    /// don't animate (the OS asks for reduced motion).
+    wait_ticker: bool,
 
     /// Latest window geometry seen in `render`, and whether a debounced write of
     /// it is already scheduled (resizing renders every frame — one write wins).
@@ -325,12 +345,25 @@ impl Workspace {
         // The terminal's shell (Settings): empty runs the platform default,
         // which the placeholder names. Saved as typed; the next terminal
         // started uses it.
-        let shell_choices = crate::terminal::shell_choices();
-        let shell_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(crate::terminal::default_shell())
-                .default_value(settings.terminal_shell.clone())
+        let shell_input =
+            cx.new(|cx| InputState::new(window, cx).default_value(settings.terminal_shell.clone()));
+        let shells = cx.background_spawn(async {
+            (
+                crate::terminal::default_shell(),
+                crate::terminal::shell_choices(),
+            )
         });
+        cx.spawn(async move |this, cx| {
+            let (default, choices) = shells.await;
+            this.update(cx, |this, cx| {
+                this.default_shell = Some(default);
+                this.shell_choices = choices;
+                this.shell_placeholder_due = true;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.subscribe(&shell_input, |this, input, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
                 let shell = input.read(cx).value().trim().to_string();
@@ -348,6 +381,7 @@ impl Workspace {
         window.on_window_should_close(cx, move |window, cx| {
             save_window_geometry(window);
             let _ = weak.update(cx, |this, cx| this.flush_session(cx));
+            session::store::flush_scratch();
             true
         });
 
@@ -373,6 +407,7 @@ impl Workspace {
             cell_input,
             cell_multi,
             lsp_slot: lsp::new_slot(),
+            lsp_gen: 0,
             log: QueryLog::default(),
             modal: None,
             cancel_dont_ask: false,
@@ -383,13 +418,19 @@ impl Workspace {
             terminal_open: false,
             terminal_gen: 0,
             shell_input,
-            shell_choices,
+            shell_choices: Vec::new(),
             pending_shell: None,
+            default_shell: None,
+            shell_placeholder_due: false,
             settings,
             passwords: HashMap::new(),
             conn_adding: false,
             form,
             host_key: None,
+            connecting: None,
+            connect_gen: 0,
+            connect_error: None,
+            wait_ticker: false,
             pending_geom: None,
             geom_flush: false,
             autoscroll: None,
@@ -453,6 +494,38 @@ impl Workspace {
                 cx.notify();
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// Whether anything shows a loader with an elapsed counter.
+    fn waiting(&self) -> bool {
+        self.connecting.is_some() || self.tabs.iter().any(|t| t.running)
+    }
+
+    /// Repaint once a second while `waiting` (see `wait_ticker`).
+    pub(super) fn tick_wait_labels(&mut self, cx: &mut Context<Self>) {
+        if self.wait_ticker || !self.waiting() {
+            return;
+        }
+        self.wait_ticker = true;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(1))
+                .await;
+            let go_on = this
+                .update(cx, |this, cx| {
+                    let waiting = this.waiting();
+                    this.wait_ticker = waiting;
+                    if waiting {
+                        cx.notify();
+                    }
+                    waiting
+                })
+                .unwrap_or(false);
+            if !go_on {
+                break;
+            }
         })
         .detach();
     }
@@ -535,7 +608,13 @@ impl Workspace {
 
     fn open_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let style = crate::terminal::TerminalStyle::from_theme(cx);
-        match crate::terminal::spawn(&self.settings.terminal_shell, style, cx) {
+        // The default shell as found at startup (`spawn` looks for it itself
+        // if that isn't done yet).
+        let command = match (self.settings.terminal_shell.trim(), &self.default_shell) {
+            ("", Some(default)) => default.clone(),
+            (shell, _) => shell.to_string(),
+        };
+        match crate::terminal::spawn(&command, style, cx) {
             Ok((term, exited)) => {
                 self.terminal_gen += 1;
                 let gen = self.terminal_gen;
@@ -557,7 +636,7 @@ impl Workspace {
                 self.terminal_open = true;
             }
             Err(e) => {
-                let shell = match self.settings.terminal_shell.trim() {
+                let shell = match command.as_str() {
                     "" => crate::terminal::default_shell(),
                     s => s.to_string(),
                 };
@@ -630,6 +709,12 @@ impl Workspace {
     /// A shell picked from Settings' list (or Browse) goes into the field —
     /// which saves it, like typing would.
     pub(super) fn flush_pending_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.shell_placeholder_due) {
+            if let Some(default) = self.default_shell.clone() {
+                self.shell_input
+                    .update(cx, |i, cx| i.set_placeholder(default, window, cx));
+            }
+        }
         if let Some(shell) = self.pending_shell.take() {
             self.shell_input
                 .update(cx, |i, cx| i.replace_all(shell, window, cx));

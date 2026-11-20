@@ -466,6 +466,9 @@ impl Workspace {
     }
 
     pub(super) fn cancel_pending(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        if self.refuse_if_running(tab_id, cx) {
+            return;
+        }
         let reload = {
             let Some(tab) = self.tab_mut(tab_id) else {
                 return;
@@ -483,7 +486,9 @@ impl Workspace {
     }
 
     /// Execute a tab's staged edits in a single transaction, then reload it:
-    /// the same query again, so its filter, sort and page stay.
+    /// the same query again, so its filter, sort and page stay. The tab is
+    /// locked like a run meanwhile (loader over the grid, no editing); Stop
+    /// rolls the batch back and stages it again.
     pub(super) fn apply_pending(&mut self, tab_id: u64, cx: &mut Context<Self>) {
         let (target, edits, reload) = {
             let Some(tab) = self.tab_mut(tab_id) else {
@@ -505,22 +510,41 @@ impl Workspace {
             }
             return;
         };
+        let Some(gen) = self.begin_run(tab_id, Busy::Applying(edits.len())) else {
+            return;
+        };
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.applying = Some(edits.clone());
+        }
         let sql = skimrow_db::build_batch(&target, &edits)
             .ok()
             .flatten()
             .unwrap_or_default();
         self.status = "Applying…".into();
         let db = self.db.clone();
-        // The future owns the edits and hands them back for retry-on-failure.
         let fut = async move {
             let res = db.apply_edits(session, &target, &edits).await;
             (res, edits)
         };
         self.spawn_db(cx, fut, move |this, (res, edits), cx| {
+            let current = this.current_run(tab_id, gen).is_some();
+            let Some(tab) = this.tab_mut(tab_id) else {
+                return;
+            };
+            if current {
+                tab.running = false;
+            }
+            let since = tab.busy_since;
             let status = match res {
                 Ok(()) => {
                     this.log.push(&sql, true);
                     if let Some(tab) = this.tab_mut(tab_id) {
+                        // Even after a Stop (the COMMIT beat the cancel): they're
+                        // in, so they must not stay staged to be sent twice.
+                        tab.applying = None;
+                        if !current {
+                            tab.pending.clear();
+                        }
                         tab.edited_cells.clear();
                         // Rows came or went: the pager's count is stale.
                         if edits.iter().any(|e| !matches!(e, RowEdit::Update { .. })) {
@@ -528,13 +552,16 @@ impl Workspace {
                         }
                     }
                     if let Some(s) = reload {
-                        this.run_sql(tab_id, s, cx);
+                        this.chain_run(tab_id, since, cx, |this, cx| this.run_sql(tab_id, s, cx));
                     }
                     format!("Applied {} change(s)", edits.len())
                 }
+                // Stopped: Stop has staged them again already.
+                Err(_) if !current => return,
                 Err(e) => {
                     // Keep the edits staged so the user can fix and retry.
                     if let Some(tab) = this.tab_mut(tab_id) {
+                        tab.applying = None;
                         tab.pending = edits;
                     }
                     this.log.push(&sql, false);
@@ -913,6 +940,92 @@ mod tests {
                     ws.tab(id).unwrap().rows[0][1],
                     CellValue::Text("alpha".into())
                 );
+            })
+            .unwrap();
+    }
+
+    /// A tab with one staged change, ready to Apply over a connection.
+    fn staged_tab(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> u64 {
+        let id = seed_query_tab(ws, window, cx);
+        ws.conn = Some(1);
+        seed_rows(ws, id, vec!["id", "name"], 2, cx);
+        editable_tab(ws, id, vec!["id", "name"]);
+        let tab = ws.tab_mut(id).unwrap();
+        tab.last_sql = Some("SELECT * FROM widget".into());
+        tab.pending = vec![RowEdit::Update {
+            pk: vec![("id".into(), CellValue::Text("r0c0".into()))],
+            set: vec![("name".into(), CellValue::Text("x".into()))],
+        }];
+        tab.edited_cells.insert((0, 1));
+        id
+    }
+
+    /// Apply locks the tab like a run (loader, no editing, no second Apply);
+    /// Stop stages the changes again at once — and if the COMMIT beat the
+    /// cancel after all, they're dropped rather than left to be sent twice.
+    #[gpui::test]
+    fn apply_locks_the_tab_and_stop_restages(cx: &mut TestAppContext) {
+        let (window, mut unserved) = unserved_workspace(cx);
+        let id = window
+            .update(cx, |ws, window, cx| {
+                let id = staged_tab(ws, window, cx);
+                ws.apply_pending(id, cx);
+                let tab = ws.tab(id).unwrap();
+                assert!(tab.running);
+                assert_eq!(tab.busy, Busy::Applying(1));
+                assert_eq!(tab.loader(), Some(Loader::OverData));
+                assert!(tab.pending.is_empty());
+                // Locked: no cell editing, no re-run.
+                ws.begin_edit(id, 0, 1, window, cx);
+                assert!(ws.tab(id).unwrap().editing.is_none());
+                assert!(ws.refuse_if_running(id, cx));
+                assert!(ws.status.contains("being applied"), "{}", ws.status);
+                ws.cancel_tab(id, cx);
+                let tab = ws.tab(id).unwrap();
+                assert!(!tab.running);
+                assert_eq!(tab.pending.len(), 1);
+                assert!(ws.status.contains("still staged"), "{}", ws.status);
+                id
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(unserved.answer_applies(Ok(())), 1);
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _w, _| {
+                let tab = ws.tab(id).unwrap();
+                assert!(tab.pending.is_empty() && tab.edited_cells.is_empty());
+                assert!(tab.applying.is_none());
+                // …and it reloads.
+                assert!(tab.running && tab.busy == Busy::Running);
+            })
+            .unwrap();
+    }
+
+    /// A failed Apply frees the tab and keeps the changes staged for a retry.
+    #[gpui::test]
+    fn failed_apply_keeps_the_changes(cx: &mut TestAppContext) {
+        let (window, mut unserved) = unserved_workspace(cx);
+        let id = window
+            .update(cx, |ws, window, cx| {
+                let id = staged_tab(ws, window, cx);
+                ws.apply_pending(id, cx);
+                id
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            unserved.answer_applies(Err(skimrow_db::DbError::Query("nope".into()))),
+            1
+        );
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _w, _| {
+                let tab = ws.tab(id).unwrap();
+                assert!(!tab.running);
+                assert_eq!(tab.pending.len(), 1);
+                assert!(tab.edited_cells.contains(&(0, 1)));
+                assert!(ws.status.starts_with("Apply failed"), "{}", ws.status);
             })
             .unwrap();
     }
