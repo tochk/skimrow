@@ -600,6 +600,17 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Settings → the connect timeout (0 = none), from the next connect on.
+    pub(super) fn set_connect_timeout(&mut self, secs: u64, cx: &mut Context<Self>) {
+        let secs = secs.min(skimrow_config::CONNECT_TIMEOUT_MAX);
+        if secs == self.settings.connect_timeout_secs {
+            return;
+        }
+        self.settings.connect_timeout_secs = secs;
+        self.save_settings();
+        cx.notify();
+    }
+
     /// Settings → ask before cancelling a query from its loader.
     pub(super) fn set_confirm_query_cancel(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.confirm_query_cancel = on;

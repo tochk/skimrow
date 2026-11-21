@@ -3,6 +3,18 @@
 use super::*;
 use gpui::TestAppContext;
 
+/// A workspace whose database requests the test answers itself (on its own
+/// thread — see `DbHandle::unserved`).
+pub(super) fn unserved_workspace(
+    cx: &mut TestAppContext,
+) -> (gpui::WindowHandle<Workspace>, skimrow_db::Unserved) {
+    cx.update(gpui_component::init);
+    let (db, unserved) = DbHandle::unserved();
+    let window =
+        cx.add_window(|window, cx| Workspace::new(db, Settings::default(), None, window, cx));
+    (window, unserved)
+}
+
 pub(super) fn new_workspace(cx: &mut TestAppContext) -> gpui::WindowHandle<Workspace> {
     cx.update(|cx| gpui_component::init(cx));
     let db = DbHandle::idle();

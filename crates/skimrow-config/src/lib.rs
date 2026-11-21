@@ -88,6 +88,9 @@ pub struct Settings {
     /// queries (its connection pool). A tab inside a transaction holds one
     /// more until it ends.
     pub pool_size: usize,
+    /// Longest opening a database connection may take, in seconds (SSH
+    /// tunnel, TCP, TLS, login, init SQL together); 0 = no limit.
+    pub connect_timeout_secs: u64,
     /// A click on a running query's loader asks before cancelling it.
     pub confirm_query_cancel: bool,
     /// Bottom-panel visibility, toggled from the status bar.
@@ -109,6 +112,9 @@ pub struct Settings {
 /// `Settings::pool_size` range the UI allows.
 pub const POOL_SIZE_MAX: usize = 32;
 
+/// Largest `Settings::connect_timeout_secs` the UI allows.
+pub const CONNECT_TIMEOUT_MAX: u64 = 600;
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -120,6 +126,7 @@ impl Default for Settings {
             vim_navigation: false,
             restore_tabs: true,
             pool_size: 4,
+            connect_timeout_secs: 30,
             confirm_query_cancel: true,
             show_query_log: true,
             show_messages: true,
@@ -457,6 +464,7 @@ mod tests {
             vim_navigation: true,
             restore_tabs: false,
             pool_size: 7,
+            connect_timeout_secs: 0,
             confirm_query_cancel: false,
             show_query_log: false,
             show_messages: true,
@@ -477,6 +485,7 @@ mod tests {
         assert!(!back.restore_tabs);
         assert!(!back.terminal_ctrl_clipboard);
         assert_eq!(back.pool_size, 7);
+        assert_eq!(back.connect_timeout_secs, 0);
         assert_eq!(back.connections[0].id, "abc");
         assert_eq!(back.connections[0].params, ["application_name=x"]);
         assert_eq!(back.connections[0].init_sql, "SET search_path TO app");
@@ -523,6 +532,7 @@ mod tests {
         // says otherwise.
         assert!(s.restore_tabs && s.terminal_ctrl_clipboard);
         assert_eq!(s.pool_size, 4);
+        assert_eq!(s.connect_timeout_secs, 30);
         // Both bottom panels showing; cancelling from the loader asks first.
         assert!(s.show_query_log && s.show_messages);
         assert!(s.confirm_query_cancel);

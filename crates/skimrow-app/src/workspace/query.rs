@@ -78,14 +78,48 @@ impl Workspace {
         Some(session)
     }
 
-    /// Start a run of `tab_id`: whatever it still has in flight is stale from
-    /// here on. Returns the run's number for `current_run`.
-    pub(super) fn begin_run(&mut self, tab_id: u64) -> Option<u64> {
+    /// Start a run of `tab_id` that waits for `busy`: whatever it still has
+    /// in flight is stale from here on. Returns the run's number for
+    /// `current_run`.
+    pub(super) fn begin_run(&mut self, tab_id: u64, busy: Busy) -> Option<u64> {
         let tab = self.tab_mut(tab_id)?;
         tab.run_gen += 1;
         tab.running = true;
+        tab.busy = busy;
+        tab.busy_since = Instant::now();
         tab.run_error = None;
         Some(tab.run_gen)
+    }
+
+    /// A step of a longer wait (primary key → rows, count → last page, apply
+    /// → reload) has ended and `next` starts the following one: if that runs,
+    /// its loader counts from when the whole wait began, not from zero.
+    pub(super) fn chain_run(
+        &mut self,
+        tab_id: u64,
+        since: Instant,
+        cx: &mut Context<Self>,
+        next: impl FnOnce(&mut Self, &mut Context<Self>),
+    ) {
+        next(self, cx);
+        if let Some(tab) = self.tab_mut(tab_id).filter(|t| t.running) {
+            tab.busy_since = since;
+        }
+    }
+
+    /// The user asked `tab_id` to run (or re-run, sort, page…) while it still
+    /// is: refuse, saying so. Stop first — a second run would only queue
+    /// behind the first on the tab's connection.
+    pub(super) fn refuse_if_running(&mut self, tab_id: u64, cx: &mut Context<Self>) -> bool {
+        let Some(tab) = self.tab(tab_id).filter(|t| t.running) else {
+            return false;
+        };
+        self.status = match tab.busy {
+            Busy::Applying(_) => "Changes are being applied — wait, or Stop".into(),
+            _ => "Query running — Stop it first".into(),
+        };
+        cx.notify();
+        true
     }
 
     /// `tab_id`, if run `gen` is still its latest (not stopped or superseded).
@@ -113,6 +147,12 @@ impl Workspace {
         if self.active_tab().is_some_and(|t| t.editing_multi) {
             self.pending_grid_focus = true;
             self.commit_cell_edit(cx);
+            return;
+        }
+        if self
+            .active_id()
+            .is_some_and(|id| self.refuse_if_running(id, cx))
+        {
             return;
         }
         let (id, is_table, full, cursor) = {
@@ -163,6 +203,9 @@ impl Workspace {
             }
         }
         let Some(id) = self.active_id() else { return };
+        if self.refuse_if_running(id, cx) {
+            return;
+        }
         // Like Run: the statement under the cursor, which an error is then
         // marked in.
         let sql = match self.active_tab() {
@@ -208,7 +251,7 @@ impl Workspace {
             cx.notify();
             return;
         };
-        let Some(gen) = self.begin_run(tab_id) else {
+        let Some(gen) = self.begin_run(tab_id, Busy::Explaining) else {
             return;
         };
         self.status = "Explaining…".into();
@@ -265,6 +308,9 @@ impl Workspace {
     /// Re-run a tab's current query/table from the DB (discards staged edits),
     /// keeping its filter and sort.
     pub(super) fn reload_data(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        if self.refuse_if_running(tab_id, cx) {
+            return;
+        }
         let Some(tab) = self.tab(tab_id) else {
             return;
         };
@@ -292,6 +338,9 @@ impl Workspace {
     /// WHERE, ORDER BY and header sort. The last page needs the row count;
     /// without one yet it is counted first (`count_rows`).
     pub(super) fn go_page(&mut self, tab_id: u64, to: PageMove, cx: &mut Context<Self>) {
+        if self.refuse_if_running(tab_id, cx) {
+            return;
+        }
         let Some(size) = self
             .tab(tab_id)
             .and_then(|t| tabs::page_size(&t.limit_input.read(cx).value()))
@@ -321,7 +370,7 @@ impl Workspace {
         let Some(session) = self.tab_session(tab_id) else {
             return;
         };
-        let Some(gen) = self.begin_run(tab_id) else {
+        let Some(gen) = self.begin_run(tab_id, Busy::Counting) else {
             return;
         };
         self.status = "Counting rows…".into();
@@ -338,11 +387,14 @@ impl Workspace {
                 Some(CellValue::Text(n)) => n.parse::<usize>().ok(),
                 _ => None,
             });
+            let since = tab.busy_since;
             match (out.error, total) {
                 (None, Some(total)) => {
                     tab.total_rows = Some(total);
                     this.log.push(&logged, true);
-                    this.go_page(tab_id, PageMove::Last, cx);
+                    this.chain_run(tab_id, since, cx, |this, cx| {
+                        this.go_page(tab_id, PageMove::Last, cx)
+                    });
                 }
                 (error, _) => {
                     this.log.push(&logged, false);
@@ -444,7 +496,7 @@ impl Workspace {
         let Some(session) = self.tab_session(tab_id) else {
             return;
         };
-        let Some(gen) = self.begin_run(tab_id) else {
+        let Some(gen) = self.begin_run(tab_id, Busy::Running) else {
             return;
         };
         // Where these rows start in the table (the OFFSET), as of the request,
@@ -588,7 +640,12 @@ impl Workspace {
         if let Some(s) = &tab.db_session {
             s.db.cancel(s.session);
         }
-        self.status = "Cancelled".into();
+        // A stopped Apply rolls back: its changes are staged again, at once.
+        let restored = tab.applying.take().map(|edits| tab.pending = edits);
+        self.status = match restored {
+            Some(()) => "Apply cancelled — the changes are still staged".into(),
+            None => "Cancelled".into(),
+        };
         cx.notify();
     }
 
@@ -756,6 +813,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.refuse_if_running(tab_id, cx) {
+            return;
+        }
         let (next, base, headers, is_table) = {
             let Some(tab) = self.tab_mut(tab_id) else {
                 return;
@@ -1016,7 +1076,7 @@ mod tests {
                 ws.close_modal(cx);
                 ws.open_query_tab(window, cx);
                 let id = ws.active_id().unwrap();
-                let gen = ws.begin_run(id).unwrap();
+                let gen = ws.begin_run(id, Busy::Running).unwrap();
                 assert!(ws.tab(id).unwrap().running);
                 ws.cancel(cx);
                 assert!(!ws.tab(id).unwrap().running);
@@ -1039,7 +1099,7 @@ mod tests {
                 ws.close_modal(cx);
                 let id = seed_query_tab(ws, window, cx);
                 assert_eq!(ws.tab(id).unwrap().loader(), None);
-                ws.begin_run(id).unwrap();
+                ws.begin_run(id, Busy::Running).unwrap();
                 assert_eq!(ws.tab(id).unwrap().loader(), Some(Loader::Blank));
 
                 seed_rows(ws, id, vec!["id", "name"], 3, cx);
@@ -1081,7 +1141,7 @@ mod tests {
             .update(cx, |ws, window, cx| {
                 ws.close_modal(cx);
                 let id = seed_query_tab(ws, window, cx);
-                ws.begin_run(id).unwrap();
+                ws.begin_run(id, Busy::Running).unwrap();
 
                 ws.ask_cancel(id, cx);
                 ws.cancel_dont_ask = true;
@@ -1095,7 +1155,7 @@ mod tests {
                 ws.confirm_cancel(id, cx);
                 assert!(!ws.settings.confirm_query_cancel);
 
-                ws.begin_run(id).unwrap();
+                ws.begin_run(id, Busy::Running).unwrap();
                 ws.ask_cancel(id, cx);
                 assert!(!ws.modal_open());
                 assert!(!ws.tab(id).unwrap().running);
@@ -1190,7 +1250,7 @@ mod tests {
                 ws.forget_error_spot(id);
                 let err = ws.tab(id).unwrap().run_error.clone().unwrap();
                 assert_eq!((err.at, err.message.is_empty()), (None, false));
-                ws.begin_run(id);
+                ws.begin_run(id, Busy::Running);
                 assert!(ws.tab(id).unwrap().run_error.is_none());
                 // Not a server error (the connection dropped, say): the text.
                 ws.fail_run(id, stmt, 0, &DbError::Query("connection closed".into()), cx);
@@ -1267,6 +1327,57 @@ mod tests {
                 ws.log.push("BAD", false);
                 assert_eq!(ws.log.entries.len(), 2);
                 assert!(!ws.log.entries[1].ok);
+            })
+            .unwrap();
+    }
+
+    /// Running again while a run is on (Ctrl+Enter, Explain, Refresh, a sort)
+    /// is refused with a hint — it would only queue behind the first.
+    #[gpui::test]
+    fn no_second_run_while_running(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                ws.conn = Some(1);
+                {
+                    let tab = ws.tab_mut(id).unwrap();
+                    tab.base_sql = Some("SELECT 1".into());
+                    tab.headers = vec!["n".into()];
+                }
+                let editor = ws.tab(id).unwrap().editor.clone();
+                editor.update(cx, |e, cx| e.set_value("SELECT 2", window, cx));
+                let gen = ws.begin_run(id, Busy::Running).unwrap();
+                ws.run_active_tab(cx);
+                assert!(ws.status.contains("Stop it first"), "{}", ws.status);
+                ws.explain_active(false, cx);
+                ws.reload_data(id, cx);
+                ws.toggle_sort(id, 0, window, cx);
+                let tab = ws.tab(id).unwrap();
+                assert_eq!(tab.run_gen, gen);
+                assert_eq!(tab.sort_state, None);
+            })
+            .unwrap();
+    }
+
+    /// The loader's counter covers a whole multi-step wait (key → rows,
+    /// count → page), not just its last step.
+    #[gpui::test]
+    fn chained_runs_keep_counting(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                ws.begin_run(id, Busy::Counting).unwrap();
+                let since = Instant::now() - std::time::Duration::from_secs(9);
+                ws.tab_mut(id).unwrap().running = false;
+                ws.chain_run(id, since, cx, |ws, _| {
+                    ws.begin_run(id, Busy::Running);
+                });
+                let tab = ws.tab(id).unwrap();
+                assert_eq!(tab.busy_since, since);
+                let label = util::wait_label(&tab.busy.label(), tab.busy_since.elapsed());
+                assert_eq!(label.as_deref(), Some("Running query · 9s"));
             })
             .unwrap();
     }

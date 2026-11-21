@@ -15,8 +15,11 @@ mod ssh;
 mod tls;
 mod types;
 
-pub use actor::{Connected, DbHandle, QueryStream, Session, Unserved, DEFAULT_POOL_SIZE};
-pub use config::{ConnSetup, ConnectionConfig, SslMode};
+pub use actor::{
+    ConnectPhase, ConnectPhases, Connected, DbHandle, QueryStream, Session, Unserved,
+    DEFAULT_POOL_SIZE,
+};
+pub use config::{ConnSetup, ConnectionConfig, SslMode, DEFAULT_CONNECT_TIMEOUT};
 pub use edit::{build_batch, edit_statements, DescribedResult, EditTarget, RowEdit};
 pub use error::DbError;
 pub use export::{to_csv, to_inserts, to_json, to_tsv, ExportFormat};

@@ -165,6 +165,13 @@ struct Queued {
 enum Command {
     Connect {
         cfg: Box<ConnectionConfig>,
+        phases: mpsc::UnboundedSender<ConnectPhase>,
+        reply: oneshot::Sender<Result<Connected, DbError>>,
+    },
+    /// A `Connect` finished opening (internal; the opening runs off the loop).
+    Opened {
+        cfg: Box<ConnectionConfig>,
+        result: Result<Opened, DbError>,
         reply: oneshot::Sender<Result<Connected, DbError>>,
     },
     Job {
@@ -189,6 +196,10 @@ enum Command {
     Disconnect {
         conn: ConnId,
     },
+    Test {
+        cfg: Box<ConnectionConfig>,
+        reply: oneshot::Sender<Result<String, DbError>>,
+    },
     /// A pooled connection finished dialing (internal), for setup `gen`.
     Dialed {
         conn: ConnId,
@@ -212,6 +223,30 @@ enum Command {
         retry: Option<Queued>,
     },
 }
+
+/// What opening a connection made: the pool's TLS connector, its SSH tunnel
+/// and its first Postgres connection.
+struct Opened {
+    connector: MakeRustlsConnect,
+    tunnel: Option<Arc<Tunnel>>,
+    first: Client,
+}
+
+/// Where a [`DbHandle::open`] is, for showing a slow one's progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectPhase {
+    /// Loading the OS trust store (the verifying SSL modes; slow on some
+    /// systems).
+    Certificates,
+    /// Opening the SSH tunnel.
+    SshTunnel,
+    /// Reaching the database itself: TCP, TLS, authentication, init SQL.
+    Server,
+}
+
+/// The phases a connect goes through ([`DbHandle::open_watched`]); closes
+/// when the connect is over. Named so UI crates needn't depend on Tokio.
+pub type ConnectPhases = mpsc::UnboundedReceiver<ConnectPhase>;
 
 /// A pooled Postgres connection and the setup it was opened with.
 struct Pooled {
@@ -551,20 +586,119 @@ impl ConnState {
 
 /// The requests sent to a [`DbHandle::unserved`].
 #[doc(hidden)]
-pub struct Unserved(mpsc::UnboundedReceiver<Command>);
+pub struct Unserved {
+    rx: mpsc::UnboundedReceiver<Command>,
+    /// Requests looked at but kept waiting for a later answer, in order.
+    held: VecDeque<Command>,
+}
 
 impl Unserved {
+    /// Every request so far, held ones first.
+    fn take_all(&mut self) -> Vec<Command> {
+        let mut all: Vec<Command> = self.held.drain(..).collect();
+        while let Ok(command) = self.rx.try_recv() {
+            all.push(command);
+        }
+        all
+    }
+
     /// Fail every connect sent so far, as an unreachable server does, and drop
     /// the other requests.
     pub fn refuse_all(&mut self) {
         self.fail_all(DbError::Connect("refused".into()));
     }
 
-    /// Fail every connect sent so far with `err`, and drop the other requests.
+    /// Fail every connect and connection test sent so far with `err`, and
+    /// drop the other requests.
     pub fn fail_all(&mut self, err: DbError) {
-        while let Ok(command) = self.0.try_recv() {
+        for command in self.take_all() {
+            match command {
+                Command::Connect { reply, .. } => {
+                    let _ = reply.send(Err(err.clone()));
+                }
+                Command::Test { reply, .. } => {
+                    let _ = reply.send(Err(err.clone()));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Answer every connect sent so far as opened, numbering them from `id`,
+    /// and drop the other requests. Returns how many it answered.
+    pub fn accept_connects(&mut self, mut id: ConnId) -> usize {
+        let mut n = 0;
+        for command in self.take_all() {
             if let Command::Connect { reply, .. } = command {
-                let _ = reply.send(Err(err.clone()));
+                let _ = reply.send(Ok(Connected { id, local: None }));
+                id += 1;
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Report `phase` on every connect sent so far, keeping every request
+    /// waiting. Returns how many connects there are.
+    pub fn report_phase(&mut self, phase: ConnectPhase) -> usize {
+        let all = self.take_all();
+        let mut n = 0;
+        for command in &all {
+            if let Command::Connect { phases, .. } = command {
+                let _ = phases.send(phase);
+                n += 1;
+            }
+        }
+        self.held.extend(all);
+        n
+    }
+
+    /// How many jobs (queries, introspection, applies…) were sent so far
+    /// and not answered; they stay waiting.
+    pub fn pending_jobs(&mut self) -> usize {
+        let all = self.take_all();
+        let n = all
+            .iter()
+            .filter(|c| matches!(c, Command::Job { .. }))
+            .count();
+        self.held.extend(all);
+        n
+    }
+
+    /// Fail every job sent so far with `err`, and drop the other requests.
+    pub fn fail_jobs(&mut self, err: DbError) {
+        for command in self.take_all() {
+            if let Command::Job { job, .. } = command {
+                job.fail(err.clone());
+            }
+        }
+    }
+
+    /// Answer every edit batch sent so far with `result`, keeping the other
+    /// requests waiting. Returns how many it answered.
+    pub fn answer_applies(&mut self, result: Result<(), DbError>) -> usize {
+        let mut n = 0;
+        for command in self.take_all() {
+            match command {
+                Command::Job {
+                    job: Job::Apply { reply, .. },
+                    ..
+                } => {
+                    let _ = reply.send(result.clone());
+                    n += 1;
+                }
+                other => self.held.push_back(other),
+            }
+        }
+        n
+    }
+
+    /// Answer every connection test sent so far as a server of `version`
+    /// would, and drop the other requests.
+    pub fn pass_tests(&mut self, version: &str) {
+        for command in self.take_all() {
+            if let Command::Test { reply, .. } = command {
+                let _ = reply.send(Ok(version.to_string()));
             }
         }
     }
@@ -605,7 +739,13 @@ impl DbHandle {
     #[doc(hidden)]
     pub fn unserved() -> (Self, Unserved) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (DbHandle { tx }, Unserved(rx))
+        (
+            DbHandle { tx },
+            Unserved {
+                rx,
+                held: VecDeque::new(),
+            },
+        )
     }
 
     pub fn spawn() -> Self {
@@ -634,14 +774,32 @@ impl DbHandle {
     /// [`DbHandle::connect`], also telling where the database can be reached
     /// locally (through an SSH tunnel, when `cfg` has one).
     pub async fn open(&self, cfg: ConnectionConfig) -> Result<Connected, DbError> {
+        self.open_watched(cfg).1.await
+    }
+
+    /// [`DbHandle::open`], also reporting the phases it goes through. The
+    /// connect starts at once; dropping the returned future before it is
+    /// done abandons it (the worker stops dialing and closes what it opened).
+    /// It fails with [`DbError::Timeout`] after `cfg.connect_timeout`.
+    pub fn open_watched(
+        &self,
+        cfg: ConnectionConfig,
+    ) -> (
+        ConnectPhases,
+        impl std::future::Future<Output = Result<Connected, DbError>> + 'static,
+    ) {
+        let (phases, phase_rx) = mpsc::unbounded_channel();
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Command::Connect {
-                cfg: Box::new(cfg),
-                reply,
-            })
-            .map_err(|_| DbError::WorkerGone)?;
-        rx.await.map_err(|_| DbError::WorkerGone)?
+        let sent = self.tx.send(Command::Connect {
+            cfg: Box::new(cfg),
+            phases,
+            reply,
+        });
+        let fut = async move {
+            sent.map_err(|_| DbError::WorkerGone)?;
+            rx.await.map_err(|_| DbError::WorkerGone)?
+        };
+        (phase_rx, fut)
     }
 
     /// Most Postgres connections `conn` keeps open at once (at least 1;
@@ -660,6 +818,20 @@ impl DbHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Command::SetSetup { conn, setup, reply })
+            .map_err(|_| DbError::WorkerGone)?;
+        rx.await.map_err(|_| DbError::WorkerGone)?
+    }
+
+    /// Try `cfg` out without keeping anything open: one connection (through
+    /// its SSH tunnel, if it has one) with its setup, asked for the server's
+    /// `version()`, then closed.
+    pub async fn test(&self, cfg: ConnectionConfig) -> Result<String, DbError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Test {
+                cfg: Box::new(cfg),
+                reply,
+            })
             .map_err(|_| DbError::WorkerGone)?;
         rx.await.map_err(|_| DbError::WorkerGone)?
     }
@@ -1079,26 +1251,45 @@ async fn worker(tx: mpsc::UnboundedSender<Command>, mut rx: mpsc::UnboundedRecei
         };
         // The connection whose pool may have work to start now.
         let touched = match cmd {
-            Command::Connect { cfg, reply } => {
-                let opened = async {
-                    let connector = make_connector(&cfg)?;
-                    let tunnel = match &cfg.ssh {
-                        Some(ssh) => Some(Arc::new(
-                            Tunnel::open(ssh.clone(), cfg.host.clone(), cfg.port).await?,
-                        )),
-                        None => None,
+            Command::Connect {
+                cfg,
+                phases,
+                mut reply,
+            } => {
+                // Off the loop: a slow server (or a slow trust store) mustn't
+                // hold up every other connection's work, nor Cancel.
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let opening = within(cfg.connect_timeout, open_conn(&cfg, &phases));
+                    let result = tokio::select! {
+                        result = opening => result,
+                        // The caller gave up: stop, dropping what was opened.
+                        () = reply.closed() => return,
                     };
-                    let first = dial(&cfg, &connector, tunnel.as_deref()).await?;
-                    Ok::<_, DbError>((connector, tunnel, first))
-                };
-                let result = opened.await.map(|(connector, tunnel, first)| {
-                    let id = next_id;
-                    next_id += 1;
-                    let local = tunnel.as_ref().map(|t| t.addr);
-                    conns.insert(id, ConnState::new(*cfg, connector, tunnel, first));
-                    Connected { id, local }
+                    let _ = tx.send(Command::Opened { cfg, result, reply });
                 });
-                let _ = reply.send(result);
+                None
+            }
+            Command::Opened { cfg, result, reply } => {
+                match result {
+                    Ok(opened) if !reply.is_closed() => {
+                        let id = next_id;
+                        next_id += 1;
+                        let local = opened.tunnel.as_ref().map(|t| t.addr);
+                        let state =
+                            ConnState::new(*cfg, opened.connector, opened.tunnel, opened.first);
+                        conns.insert(id, state);
+                        if reply.send(Ok(Connected { id, local })).is_err() {
+                            // Abandoned just now: close it again.
+                            conns.remove(&id);
+                        }
+                    }
+                    // Abandoned while it opened: dropping it closes it.
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
                 None
             }
             Command::Job { session, job } => match conns.get_mut(&session.conn) {
@@ -1147,6 +1338,13 @@ async fn worker(tx: mpsc::UnboundedSender<Command>, mut rx: mpsc::UnboundedRecei
                         let _ = reply.send(Err(DbError::NoConnection(conn)));
                     }
                 }
+                None
+            }
+            Command::Test { cfg, reply } => {
+                // Off the worker loop: a slow server mustn't hold up the pools.
+                tokio::spawn(async move {
+                    let _ = reply.send(test_connection(&cfg).await);
+                });
                 None
             }
             Command::SetupDialed {
@@ -1336,9 +1534,68 @@ async fn apply_batch(client: &Client, batch: &str) -> Result<(), DbError> {
     }
 }
 
+/// `fut`, failing with [`DbError::Timeout`] once `limit` has passed.
+async fn within<T>(
+    limit: Option<Duration>,
+    fut: impl std::future::Future<Output = Result<T, DbError>>,
+) -> Result<T, DbError> {
+    match limit {
+        Some(limit) => tokio::time::timeout(limit, fut)
+            .await
+            .unwrap_or(Err(DbError::Timeout(limit))),
+        None => fut.await,
+    }
+}
+
+/// [`make_connector`] on a blocking thread: the verifying modes load the OS
+/// trust store, which can take seconds.
+async fn connector_for(cfg: &ConnectionConfig) -> Result<MakeRustlsConnect, DbError> {
+    let cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || make_connector(&cfg))
+        .await
+        .map_err(|e| DbError::Tls(e.to_string()))?
+}
+
+/// Everything a new pool needs — connector, tunnel, first connection —
+/// telling `phases` where it is.
+async fn open_conn(
+    cfg: &ConnectionConfig,
+    phases: &mpsc::UnboundedSender<ConnectPhase>,
+) -> Result<Opened, DbError> {
+    if cfg.ssl_mode.verifies() {
+        let _ = phases.send(ConnectPhase::Certificates);
+    }
+    let connector = connector_for(cfg).await?;
+    let tunnel = match &cfg.ssh {
+        Some(ssh) => {
+            let _ = phases.send(ConnectPhase::SshTunnel);
+            Some(Arc::new(
+                Tunnel::open(ssh.clone(), cfg.host.clone(), cfg.port).await?,
+            ))
+        }
+        None => None,
+    };
+    let _ = phases.send(ConnectPhase::Server);
+    let first = dial(cfg, &connector, tunnel.as_deref()).await?;
+    Ok(Opened {
+        connector,
+        tunnel,
+        first,
+    })
+}
+
 /// Open one Postgres connection (through `tunnel`, if given), spawn its
-/// protocol driver, and run the setup's init SQL on it.
+/// protocol driver, and run the setup's init SQL on it — within the config's
+/// `connect_timeout`.
 async fn dial(
+    cfg: &ConnectionConfig,
+    connector: &MakeRustlsConnect,
+    tunnel: Option<&Tunnel>,
+) -> Result<Client, DbError> {
+    within(cfg.connect_timeout, dial_now(cfg, connector, tunnel)).await
+}
+
+async fn dial_now(
     cfg: &ConnectionConfig,
     connector: &MakeRustlsConnect,
     tunnel: Option<&Tunnel>,
@@ -1351,9 +1608,14 @@ async fn dial(
         // A tunnel that couldn't carry the connection knows why; the
         // client only saw its socket close.
         .map_err(|e| {
-            tunnel
-                .and_then(Tunnel::failure)
-                .unwrap_or_else(|| DbError::Connect(e.to_string()))
+            tunnel.and_then(Tunnel::failure).unwrap_or_else(|| {
+                // The server's own reason (bad password, no such
+                // database…), not tokio-postgres's bare "db error".
+                DbError::Connect(match e.as_db_error() {
+                    Some(db) => db.message().to_string(),
+                    None => e.to_string(),
+                })
+            })
         })?;
     // The connection future drives the protocol and must be polled for the
     // client to work; it resolves when the connection closes.
@@ -1362,6 +1624,32 @@ async fn dial(
     });
     init_session(&client, cfg).await?;
     Ok(client)
+}
+
+/// [`DbHandle::test`]: dial once, read the server version, close it all —
+/// within the config's `connect_timeout`, like a connect.
+async fn test_connection(cfg: &ConnectionConfig) -> Result<String, DbError> {
+    within(cfg.connect_timeout, test_now(cfg)).await
+}
+
+async fn test_now(cfg: &ConnectionConfig) -> Result<String, DbError> {
+    let connector = connector_for(cfg).await?;
+    let tunnel = match &cfg.ssh {
+        Some(ssh) => Some(Tunnel::open(ssh.clone(), cfg.host.clone(), cfg.port).await?),
+        None => None,
+    };
+    let client = dial_now(cfg, &connector, tunnel.as_ref()).await?;
+    let rows = client
+        .simple_query("SELECT version()")
+        .await
+        .map_err(|e| DbError::from_pg(&e))?;
+    Ok(rows
+        .iter()
+        .find_map(|m| match m {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+            _ => None,
+        })
+        .unwrap_or_default())
 }
 
 /// Run the setup's init SQL (if any) on a fresh or just-reset connection.

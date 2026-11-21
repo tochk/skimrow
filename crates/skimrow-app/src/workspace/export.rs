@@ -107,12 +107,20 @@ impl Workspace {
         let suggested = format!("{base}.{}", fmt.extension());
         let dir = export_dir();
         let save = cx.prompt_for_new_path(&dir, Some(&suggested));
+        let background = cx.background_executor().clone();
         let fut = async move {
             let path = match save.await {
                 Ok(Ok(Some(p))) => p,
                 _ => return None, // cancelled or dialog unavailable
             };
-            Some(match std::fs::write(&path, data) {
+            // Off the UI thread: the file may be on a slow (network) drive.
+            let written = {
+                let path = path.clone();
+                background
+                    .spawn(async move { std::fs::write(&path, data) })
+                    .await
+            };
+            Some(match written {
                 Ok(()) => format!("Exported to {}", path.display()),
                 Err(e) => format!("Export failed: {e}"),
             })

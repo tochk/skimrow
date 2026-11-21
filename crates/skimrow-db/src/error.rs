@@ -14,6 +14,10 @@ pub enum DbError {
     #[error("connection failed: {0}")]
     Connect(String),
 
+    /// Opening a connection took longer than its `connect_timeout`.
+    #[error("connection timed out after {}s", .0.as_secs())]
+    Timeout(std::time::Duration),
+
     /// A structured error raised by the Postgres server.
     #[error("{message}")]
     Postgres {

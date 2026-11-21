@@ -15,6 +15,8 @@ pub(super) const ENV_CONN_KEY: &str = "env";
 #[cfg(not(test))]
 pub(super) mod store {
     use skimrow_config::SavedTabs;
+    use std::sync::{mpsc, Mutex, OnceLock};
+    use std::time::Duration;
 
     pub(crate) fn load_tabs(key: &str) -> Option<SavedTabs> {
         skimrow_config::load_tabs(key).unwrap_or_else(|e| {
@@ -33,8 +35,73 @@ pub(super) mod store {
         skimrow_config::load_scratch_for(key)
     }
 
+    /// A save for the scratch writer, or a wait until it has written all.
+    enum ScratchWrite {
+        Save(Option<String>, String),
+        Flush(mpsc::Sender<()>),
+    }
+
+    /// Scratch text goes to disk on its own thread: it's saved on every
+    /// keystroke, and a config dir on a slow (network) drive would otherwise
+    /// make typing stall. One thread keeps the writes in order; a burst
+    /// writes only its latest text per file.
+    fn scratch_writer() -> &'static Mutex<mpsc::Sender<ScratchWrite>> {
+        static WRITER: OnceLock<Mutex<mpsc::Sender<ScratchWrite>>> = OnceLock::new();
+        WRITER.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<ScratchWrite>();
+            let spawned = std::thread::Builder::new()
+                .name("skimrow-scratch".into())
+                .spawn(move || {
+                    while let Ok(first) = rx.recv() {
+                        let mut latest: Vec<(Option<String>, String)> = Vec::new();
+                        let mut flushed = Vec::new();
+                        let mut next = Some(first);
+                        while let Some(write) = next.take().or_else(|| rx.try_recv().ok()) {
+                            match write {
+                                ScratchWrite::Save(key, text) => {
+                                    match latest.iter_mut().find(|(k, _)| *k == key) {
+                                        Some(entry) => entry.1 = text,
+                                        None => latest.push((key, text)),
+                                    }
+                                }
+                                ScratchWrite::Flush(ack) => flushed.push(ack),
+                            }
+                        }
+                        for (key, text) in latest {
+                            skimrow_config::save_scratch_for(key.as_deref(), &text);
+                        }
+                        for ack in flushed {
+                            let _ = ack.send(());
+                        }
+                    }
+                });
+            if let Err(e) = spawned {
+                crate::workspace::log(format!("scratch writer failed to start: {e}"));
+            }
+            Mutex::new(tx)
+        })
+    }
+
     pub(crate) fn save_scratch(key: Option<&str>, text: &str) {
-        skimrow_config::save_scratch_for(key, text);
+        let write = ScratchWrite::Save(key.map(str::to_string), text.to_string());
+        if let Ok(writer) = scratch_writer().lock() {
+            if writer.send(write).is_err() {
+                // No writer thread: write here instead.
+                skimrow_config::save_scratch_for(key, text);
+            }
+        }
+    }
+
+    /// Wait (two seconds at most) until every scratch save so far is on
+    /// disk — the app is closing.
+    pub(crate) fn flush_scratch() {
+        let (ack, done) = mpsc::channel();
+        let sent = scratch_writer()
+            .lock()
+            .is_ok_and(|w| w.send(ScratchWrite::Flush(ack)).is_ok());
+        if sent {
+            let _ = done.recv_timeout(Duration::from_secs(2));
+        }
     }
 }
 
@@ -69,6 +136,8 @@ pub(super) mod store {
     pub(crate) fn save_scratch(key: Option<&str>, text: &str) {
         SCRATCH.with_borrow_mut(|m| m.insert(key.map(str::to_string), text.to_string()));
     }
+
+    pub(crate) fn flush_scratch() {}
 }
 
 /// The number for the next "Query N" tab: one past the highest in use, so a

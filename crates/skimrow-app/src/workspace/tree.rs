@@ -27,6 +27,12 @@ pub(super) struct SchemaTree {
     pub(super) pending_reveal: Option<SharedString>,
     /// In-flight lazy-load guard (schema + relation ids).
     pub(super) loads: HashSet<SharedString>,
+    /// Loads that failed, by the id of the node they were for (`db` for the
+    /// schema list) → why. Not retried by themselves — the node shows an
+    /// error row that retries on click / Enter; Refresh retries them all.
+    pub(super) failed: HashMap<SharedString, String>,
+    /// The schema list is being (re)loaded.
+    pub(super) schemas_loading: bool,
     /// Clear the filter input on the next render (needs `&mut Window`; set
     /// from window-less contexts like `switch_connection`).
     pub(super) pending_clear_filter: bool,
@@ -70,6 +76,8 @@ impl SchemaTree {
             filter_input,
             pending_reveal: None,
             loads: HashSet::new(),
+            failed: HashMap::new(),
+            schemas_loading: false,
             pending_clear_filter: false,
             focus: cx.focus_handle().tab_stop(true),
             sel_bounds: Rc::default(),
@@ -86,6 +94,8 @@ impl SchemaTree {
         self.sel = None;
         self.pending_reveal = None;
         self.loads.clear();
+        self.failed.clear();
+        self.schemas_loading = false;
         self.filter.clear();
         self.pending_clear_filter = true;
         self.menu = None;
@@ -145,8 +155,34 @@ pub(super) enum NodeMeta {
         name: String,
         meta: String,
     },
-    /// "loading…" / "(empty)" filler row (disabled in the widget).
+    /// "(empty)" / "(none)" filler row (disabled in the widget).
     Placeholder,
+    /// "loading…" row (with a spinner) while its parent's load runs.
+    Loading,
+    /// Its parent's load failed: an error row that retries on click / Enter.
+    Failed {
+        retry: TreeLoad,
+        message: String,
+    },
+}
+
+/// One of the tree's lazy loads, to run again.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum TreeLoad {
+    Schemas,
+    Relations { schema: String },
+    Detail { schema: String, table: String },
+}
+
+impl TreeLoad {
+    /// The node the load fills (the key of `SchemaTree::failed`).
+    pub(super) fn node(&self) -> SharedString {
+        match self {
+            TreeLoad::Schemas => "db".into(),
+            TreeLoad::Relations { schema } => node_id(&["sch", schema]),
+            TreeLoad::Detail { schema, table } => node_id(&["rel", schema, table]),
+        }
+    }
 }
 
 pub(super) type NodeMetaMap = HashMap<SharedString, NodeMeta>;
@@ -164,10 +200,39 @@ pub(super) fn placeholder_item(
     TreeItem::new(id, label).disabled(true)
 }
 
+/// The child of a node whose lazy load hasn't landed: "loading…", or the
+/// error row once it failed.
+pub(super) fn pending_item(
+    load: TreeLoad,
+    failed: &HashMap<SharedString, String>,
+    meta: &mut NodeMetaMap,
+) -> TreeItem {
+    let parent = load.node();
+    match failed.get(&parent) {
+        Some(message) => {
+            let id: SharedString = format!("fail{ID_SEP}{parent}").into();
+            meta.insert(
+                id.clone(),
+                NodeMeta::Failed {
+                    retry: load,
+                    message: message.clone(),
+                },
+            );
+            TreeItem::new(id, "Failed to load — retry")
+        }
+        None => {
+            let id: SharedString = format!("load{ID_SEP}{parent}").into();
+            meta.insert(id.clone(), NodeMeta::Loading);
+            TreeItem::new(id, "loading…").disabled(true)
+        }
+    }
+}
+
 pub(super) fn rel_tree_item(
     schema: &str,
     rel: &RelNode,
     expanded: &HashSet<SharedString>,
+    failed: &HashMap<SharedString, String>,
     meta: &mut NodeMetaMap,
 ) -> TreeItem {
     let rid = node_id(&["rel", schema, &rel.name]);
@@ -186,7 +251,13 @@ pub(super) fn rel_tree_item(
         return item;
     }
     match &rel.detail {
-        None => item = item.child(placeholder_item(&rid, "loading…", meta)),
+        None => {
+            let load = TreeLoad::Detail {
+                schema: schema.to_string(),
+                table: rel.name.clone(),
+            };
+            item = item.child(pending_item(load, failed, meta));
+        }
         Some(d) => {
             let group = |tag: &str, label_id: &mut NodeMetaMap| -> SharedString {
                 let gid = node_id(&[tag, schema, &rel.name]);
@@ -292,6 +363,7 @@ pub(super) fn build_tree(
     dbname: Option<&str>,
     tree: &[SchemaNode],
     expanded: &HashSet<SharedString>,
+    failed: &HashMap<SharedString, String>,
     filter: &str,
 ) -> (Vec<TreeItem>, NodeMetaMap) {
     let mut meta = NodeMetaMap::new();
@@ -307,7 +379,12 @@ pub(super) fn build_tree(
         let mut kids: Vec<TreeItem> = Vec::new();
         let mut matches = 0usize;
         match &node.relations {
-            None => kids.push(placeholder_item(&sid, "loading…", &mut meta)),
+            None => {
+                let load = TreeLoad::Relations {
+                    schema: node.name.clone(),
+                };
+                kids.push(pending_item(load, failed, &mut meta));
+            }
             Some(rels) => {
                 let gid = node_id(&["tbls", &node.name]);
                 meta.insert(gid.clone(), NodeMeta::Group);
@@ -317,7 +394,7 @@ pub(super) fn build_tree(
                         continue;
                     }
                     matches += 1;
-                    rel_items.push(rel_tree_item(&node.name, rel, expanded, &mut meta));
+                    rel_items.push(rel_tree_item(&node.name, rel, expanded, failed, &mut meta));
                 }
                 if rel_items.is_empty() {
                     rel_items.push(placeholder_item(&gid, "(empty)", &mut meta));
@@ -396,6 +473,9 @@ pub(super) fn build_tree(
     }
 
     let db_id = SharedString::from("db");
+    if schema_items.is_empty() && failed.contains_key(&db_id) {
+        schema_items.push(pending_item(TreeLoad::Schemas, failed, &mut meta));
+    }
     meta.insert(db_id.clone(), NodeMeta::Db);
     let exp = filtering || expanded.contains(&db_id);
     let db = TreeItem::new(db_id, dbname.to_string())
@@ -474,13 +554,29 @@ pub(super) fn sync_expansion(
 }
 
 impl Workspace {
+    /// (Re)load the schema list — after a connect, or Refresh (which also
+    /// retries every load that failed). One at a time.
     pub(super) fn load_schemas(&mut self, cx: &mut Context<Self>) {
         let Some(conn) = self.conn else { return };
+        if self.tree.schemas_loading {
+            return;
+        }
+        self.tree.schemas_loading = true;
+        self.tree.failed.clear();
         let db = self.db.clone();
         self.spawn_db(
             cx,
             async move { db.schemas(conn).await },
-            |this, result, cx| {
+            move |this, result, cx| {
+                // Not for a connection that has been replaced meanwhile.
+                if this.conn != Some(conn) {
+                    return;
+                }
+                this.tree.schemas_loading = false;
+                // The first list after a connect ends the sidebar's loader.
+                if this.connecting.as_ref().is_some_and(|c| c.connected()) {
+                    this.connecting = None;
+                }
                 match result {
                     Ok(schemas) => {
                         this.tree.schemas = schemas
@@ -493,18 +589,33 @@ impl Workspace {
                             .collect();
                         log(format!("schemas loaded: {}", this.tree.schemas.len()));
                         this.status = format!("{} schema(s)", this.tree.schemas.len());
-                        // Expansion is kept across a refresh (relations of
-                        // still-expanded schemas re-fetch via `sync_tree`).
-                        this.tree.expanded.insert("db".into());
-                        this.sync_tree(cx);
                         if std::env::var_os("SKIMROW_SELFTEST").is_some() {
                             this.selftest(cx);
                         }
                     }
-                    Err(e) => this.status = format!("Failed to load schemas: {e}"),
+                    Err(e) => {
+                        this.status = format!("Failed to load schemas: {e}");
+                        this.tree.failed.insert("db".into(), e.to_string());
+                    }
                 }
+                // Expansion is kept across a refresh (relations of
+                // still-expanded schemas re-fetch via `sync_tree`).
+                this.tree.expanded.insert("db".into());
+                this.sync_tree(cx);
             },
         );
+        cx.notify();
+    }
+
+    /// An error row's click / Enter: run its load again.
+    pub(super) fn retry_tree_load(&mut self, load: TreeLoad, cx: &mut Context<Self>) {
+        self.tree.failed.remove(&load.node());
+        match load {
+            TreeLoad::Schemas => self.load_schemas(cx),
+            TreeLoad::Relations { schema } => self.load_relations(schema, cx),
+            TreeLoad::Detail { schema, table } => self.load_relation_detail(schema, table, cx),
+        }
+        self.sync_tree(cx);
     }
 
     /// Rebuild the widget's items from the model + `expanded_ids`, kick lazy
@@ -550,6 +661,7 @@ impl Workspace {
             dbname,
             &self.tree.schemas,
             &self.tree.expanded,
+            &self.tree.failed,
             &self.tree.filter,
         )
     }
@@ -566,6 +678,7 @@ impl Workspace {
             let Some(relations) = &node.relations else {
                 if (filtering || self.tree.expanded.contains(&sid))
                     && !self.tree.loads.contains(&sid)
+                    && !self.tree.failed.contains_key(&sid)
                 {
                     schemas.push(node.name.clone());
                 }
@@ -576,7 +689,10 @@ impl Workspace {
                     continue;
                 }
                 let rid = node_id(&["rel", &node.name, &rel.name]);
-                if self.tree.expanded.contains(&rid) && !self.tree.loads.contains(&rid) {
+                if self.tree.expanded.contains(&rid)
+                    && !self.tree.loads.contains(&rid)
+                    && !self.tree.failed.contains_key(&rid)
+                {
                     rels.push((node.name.clone(), rel.name.clone()));
                 }
             }
@@ -649,8 +765,10 @@ impl Workspace {
         else {
             return;
         };
-        let Some(NodeMeta::Rel { schema, name, .. }) = self.tree.meta.get(&id).cloned() else {
-            return;
+        let (schema, name) = match self.tree.meta.get(&id).cloned() {
+            Some(NodeMeta::Rel { schema, name, .. }) => (schema, name),
+            Some(NodeMeta::Failed { retry, .. }) => return self.retry_tree_load(retry, cx),
+            _ => return,
         };
         self.open_table_tab(schema, name, window, cx);
         if let Some(tab) = self.active_tab_mut() {
@@ -670,9 +788,11 @@ impl Workspace {
     pub(super) fn load_relations(&mut self, schema: String, cx: &mut Context<Self>) {
         let Some(conn) = self.conn else { return };
         let sid = node_id(&["sch", &schema]);
-        if !self.tree.loads.insert(sid) {
+        if !self.tree.loads.insert(sid.clone()) {
             return; // already in flight
         }
+        // An explicit load (a schema's Refresh) is a retry too.
+        self.tree.failed.remove(&sid);
         let db = self.db.clone();
         let sch = schema.clone();
         let fut = async move {
@@ -681,7 +801,10 @@ impl Workspace {
             (rels, objects)
         };
         self.spawn_db(cx, fut, move |this, (rels, objects), cx| {
-            this.tree.loads.remove(&node_id(&["sch", &schema]));
+            if this.conn != Some(conn) {
+                return;
+            }
+            this.tree.loads.remove(&sid);
             match rels {
                 Ok(rels) => {
                     // Look the node up by name: the tree may have been
@@ -702,7 +825,12 @@ impl Workspace {
                     // SEQUENCES/FUNCTIONS start folded.
                     this.tree.expanded.insert(node_id(&["tbls", &schema]));
                 }
-                Err(e) => this.status = format!("Failed to load relations: {e}"),
+                Err(e) => {
+                    this.status = format!("Failed to load relations: {e}");
+                    // An error row instead of "loading…" — and no reload until
+                    // asked (`ensure_loads` would otherwise retry at once, forever).
+                    this.tree.failed.insert(sid, e.to_string());
+                }
             }
             this.sync_tree(cx);
         });
@@ -719,10 +847,14 @@ impl Workspace {
         if !self.tree.loads.insert(rid.clone()) {
             return; // already in flight
         }
+        self.tree.failed.remove(&rid);
         let db = self.db.clone();
         let (sch, tbl) = (schema.clone(), table.clone());
         let fut = async move { db.relation_detail(conn, sch, tbl).await };
         self.spawn_db(cx, fut, move |this, result, cx| {
+            if this.conn != Some(conn) {
+                return;
+            }
             this.tree.loads.remove(&rid);
             match result {
                 Ok(detail) => {
@@ -738,7 +870,10 @@ impl Workspace {
                         node.detail = Some(detail);
                     }
                 }
-                Err(e) => this.status = format!("Failed to load relation detail: {e}"),
+                Err(e) => {
+                    this.status = format!("Failed to load relation detail: {e}");
+                    this.tree.failed.insert(rid, e.to_string());
+                }
             }
             this.sync_tree(cx);
         });
@@ -808,7 +943,13 @@ mod tests {
         expanded.insert(SharedString::from("db"));
         expanded.insert(node_id(&["sch", "public"]));
 
-        let (items, meta) = build_tree(Some("skimrow"), &sample_tree(), &expanded, "");
+        let (items, meta) = build_tree(
+            Some("skimrow"),
+            &sample_tree(),
+            &expanded,
+            &HashMap::new(),
+            "",
+        );
         assert_eq!(items.len(), 1);
         let db = &items[0];
         assert!(db.is_expanded());
@@ -837,7 +978,13 @@ mod tests {
         // Filtering: only matching relations remain; loaded schemas without a
         // match drop out, unloaded ones stay (results refine as loads land);
         // db + schemas + TABLES groups are force-expanded.
-        let (items, _) = build_tree(Some("skimrow"), &sample_tree(), &HashSet::new(), "user");
+        let (items, _) = build_tree(
+            Some("skimrow"),
+            &sample_tree(),
+            &HashSet::new(),
+            &HashMap::new(),
+            "user",
+        );
         let db = &items[0];
         assert!(db.is_expanded());
         let names: Vec<_> = db.children.iter().map(|c| c.label.to_string()).collect();
@@ -848,9 +995,11 @@ mod tests {
         assert_eq!(tables.children[0].label.as_ref(), "users");
 
         // Not connected → no items at all.
-        assert!(build_tree(None, &sample_tree(), &HashSet::new(), "")
-            .0
-            .is_empty());
+        assert!(
+            build_tree(None, &sample_tree(), &HashSet::new(), &HashMap::new(), "")
+                .0
+                .is_empty()
+        );
     }
 
     #[test]
@@ -928,5 +1077,79 @@ mod tests {
                 assert!(ws.tree.loads.contains(&node_id(&["sch", "public"])));
             })
             .unwrap();
+    }
+
+    /// A schema whose relations fail to load shows an error row instead of
+    /// "loading…", and isn't loaded again until asked (it used to retry at
+    /// once, forever).
+    #[gpui::test]
+    fn failed_relations_wait_for_a_retry(cx: &mut TestAppContext) {
+        let (window, mut unserved) = unserved_workspace(cx);
+        let sid = node_id(&["sch", "public"]);
+        window
+            .update(cx, |ws, _w, cx| {
+                ws.conn = Some(1);
+                ws.cfg = Some(ConnectionConfig::new("t", "h", "db", "u"));
+                ws.tree.schemas = vec![SchemaNode {
+                    name: "public".into(),
+                    relations: None,
+                    objects: None,
+                }];
+                ws.tree.expanded.insert("db".into());
+                ws.tree.expanded.insert(sid.clone());
+                ws.sync_tree(cx);
+                assert!(ws.tree.loads.contains(&sid));
+            })
+            .unwrap();
+        // Relations, then (whatever they did) the schema's other objects.
+        for _ in 0..4 {
+            cx.run_until_parked();
+            if unserved.pending_jobs() == 0 {
+                break;
+            }
+            unserved.fail_jobs(skimrow_db::DbError::Query("boom".into()));
+        }
+        cx.run_until_parked();
+        assert_eq!(unserved.pending_jobs(), 0, "loaded again by itself");
+        window
+            .update(cx, |ws, _w, cx| {
+                assert_eq!(
+                    ws.tree.failed.get(&sid).map(String::as_str),
+                    Some("query failed: boom")
+                );
+                assert!(!ws.tree.loads.contains(&sid));
+                let fail = SharedString::from(format!("fail\u{1}{sid}"));
+                assert!(matches!(
+                    ws.tree.meta.get(&fail),
+                    Some(NodeMeta::Failed { .. })
+                ));
+                // Another sync (a filter keystroke, a toggle) doesn't retry…
+                ws.sync_tree(cx);
+                assert!(!ws.tree.loads.contains(&sid));
+                // …the error row does.
+                ws.retry_tree_load(
+                    TreeLoad::Relations {
+                        schema: "public".into(),
+                    },
+                    cx,
+                );
+                assert!(ws.tree.loads.contains(&sid) && ws.tree.failed.is_empty());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(unserved.pending_jobs(), 1);
+    }
+
+    /// "loading…" rows are their own kind (drawn with a spinner).
+    #[test]
+    fn pending_children_are_loading_rows() {
+        let tree = vec![SchemaNode {
+            name: "public".into(),
+            relations: None,
+            objects: None,
+        }];
+        let (_, meta) = build_tree(Some("db"), &tree, &HashSet::new(), &HashMap::new(), "");
+        let load = SharedString::from(format!("load\u{1}{}", node_id(&["sch", "public"])));
+        assert!(matches!(meta.get(&load), Some(NodeMeta::Loading)));
     }
 }

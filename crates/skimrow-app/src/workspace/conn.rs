@@ -4,8 +4,69 @@
 use super::*;
 use skimrow_config::secret::ssh_account;
 use skimrow_config::{SshAuthKind, SshEntry};
-use skimrow_db::{DbError, HostKey, SslMode};
+use skimrow_db::{ConnectPhase, Connected, DbError, HostKey, SslMode};
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+/// Where a connect is: what the sidebar's loader says once it's slow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ConnPhase {
+    /// Reading the stored passwords (an OS prompt may be waiting).
+    Keychain,
+    /// Loading the OS trust store (the verifying SSL modes).
+    Certificates,
+    SshTunnel,
+    /// Reaching the database: TCP, TLS, login, init SQL.
+    Server,
+    /// Connected; the schema list isn't in yet.
+    Schemas,
+}
+
+impl From<ConnectPhase> for ConnPhase {
+    fn from(phase: ConnectPhase) -> Self {
+        match phase {
+            ConnectPhase::Certificates => ConnPhase::Certificates,
+            ConnectPhase::SshTunnel => ConnPhase::SshTunnel,
+            ConnectPhase::Server => ConnPhase::Server,
+        }
+    }
+}
+
+/// A connect in flight, from the click until its schema list is in: the
+/// sidebar's and the title bar's loader.
+pub(super) struct Connecting {
+    /// `Workspace::connect_gen` it was started under.
+    pub(super) gen: u64,
+    pub(super) name: String,
+    pub(super) phase: ConnPhase,
+    pub(super) since: Instant,
+    /// The connect itself; dropping it abandons the connect (the worker stops
+    /// dialing). `None` once connected.
+    task: Option<gpui::Task<()>>,
+}
+
+impl Connecting {
+    /// Connected already, only the schema list to come (nothing to cancel).
+    pub(super) fn connected(&self) -> bool {
+        self.phase == ConnPhase::Schemas
+    }
+
+    /// What the loader says (after `LABEL_AFTER`).
+    pub(super) fn label(&self) -> String {
+        match self.phase {
+            ConnPhase::Keychain => "Reading keychain".into(),
+            ConnPhase::Certificates => "Loading certificates".into(),
+            ConnPhase::SshTunnel => "Opening SSH tunnel".into(),
+            ConnPhase::Server => format!("Connecting to {}", self.name),
+            ConnPhase::Schemas => "Loading schemas".into(),
+        }
+    }
+}
+
+/// The connect deadline Settings asks for (0 = none).
+pub(super) fn connect_timeout(settings: &Settings) -> Option<Duration> {
+    (settings.connect_timeout_secs > 0).then(|| Duration::from_secs(settings.connect_timeout_secs))
+}
 
 /// The connection form, adding a connection or editing a saved one: its
 /// inputs, which entry it edits, and how the last save went.
@@ -41,6 +102,13 @@ pub(super) struct ConnForm {
     pub(super) error: Option<String>,
     /// Waiting for the live connection to try out a new setup.
     pub(super) applying: bool,
+    /// How the last Test went: the server's version, or why it failed.
+    pub(super) test: Option<Result<String, String>>,
+    /// A Test is running.
+    pub(super) testing: bool,
+    /// Bumped by every Test and every (re)fill, so a late result of an
+    /// earlier one is dropped.
+    pub(super) test_gen: u64,
 }
 
 impl ConnForm {
@@ -98,6 +166,9 @@ impl ConnForm {
             editing: None,
             error: None,
             applying: false,
+            test: None,
+            testing: false,
+            test_gen: 0,
         }
     }
 
@@ -174,7 +245,17 @@ impl ConnForm {
         self.editing = entry.map(|e| e.id.clone());
         self.error = None;
         self.applying = false;
+        self.test = None;
+        self.testing = false;
+        self.test_gen += 1;
     }
+}
+
+/// The connection form's fields, read and checked (`Workspace::read_form`).
+struct ReadForm {
+    entry: ConnectionEntry,
+    password: Option<String>,
+    ssh_secret: Option<String>,
 }
 
 /// The parameter lines worth keeping from the editor text.
@@ -370,52 +451,24 @@ impl Workspace {
         if self.form.applying {
             return;
         }
-        let read = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
-        let name = read(&self.form.name);
-        let host = read(&self.form.host);
-        let user = read(&self.form.user);
-        let dbname = read(&self.form.db);
-        let port = read(&self.form.port).parse().unwrap_or(5432);
-        let ssl = read(&self.form.ssl);
-        let init_sql = self.form.init_sql.read(cx).value().trim().to_string();
-        let params_text = self.form.params.read(cx).value().to_string();
-        let password = self.form.password.read(cx).value().to_string();
-        let ssh_secret = self.form.ssh_secret.read(cx).value().to_string();
-
+        let (form, setup) = match self.read_form(cx) {
+            Ok(read) => read,
+            Err(msg) => {
+                self.form.error = Some(msg);
+                cx.notify();
+                return;
+            }
+        };
         let fail = |this: &mut Self, msg: String, cx: &mut Context<Self>| {
             this.form.error = Some(msg);
             cx.notify();
         };
-        if name.is_empty() || host.is_empty() || user.is_empty() || dbname.is_empty() {
-            return fail(self, "Fill name, host, user, and database".into(), cx);
-        }
-        let setup = match ConnSetup::parse(&params_text, &init_sql) {
-            Ok(setup) => setup,
-            Err(e) => return fail(self, format!("Parameters, {e}"), cx),
-        };
-        let ssh = if self.form.ssh {
-            let (host, user) = (read(&self.form.ssh_host), read(&self.form.ssh_user));
-            if host.is_empty() || user.is_empty() {
-                return fail(self, "Fill the SSH host and user".into(), cx);
-            }
-            let auth = self.form.ssh_auth;
-            Some(SshEntry {
-                host,
-                port: read(&self.form.ssh_port).parse().unwrap_or(22),
-                user,
-                auth,
-                key_file: match auth {
-                    SshAuthKind::Key => read(&self.form.ssh_key),
-                    _ => String::new(),
-                },
-            })
-        } else {
-            None
-        };
-        let ssh_secret = ssh
-            .as_ref()
-            .filter(|s| s.auth != SshAuthKind::Agent && !ssh_secret.is_empty())
-            .map(|_| ssh_secret);
+        let ReadForm {
+            mut entry,
+            password: pw,
+            ssh_secret,
+        } = form;
+        let name = entry.name.clone();
         let editing = self.form.editing.clone();
         if let Some(id) = &editing {
             if self
@@ -432,21 +485,10 @@ impl Workspace {
             }
         }
         self.form.error = None;
-        let entry = ConnectionEntry {
-            id: editing
-                .clone()
-                .unwrap_or_else(|| conn_id_for(&self.settings.connections, &name)),
-            name,
-            host,
-            port,
-            dbname,
-            user,
-            ssl_mode: if ssl.is_empty() { "prefer".into() } else { ssl },
-            params: param_lines(&params_text),
-            init_sql,
-            ssh,
-        };
-        let pw = (!password.is_empty()).then_some(password);
+        self.form.test = None;
+        entry.id = editing
+            .clone()
+            .unwrap_or_else(|| conn_id_for(&self.settings.connections, &name));
 
         let Some(old) = editing.and_then(|id| {
             self.settings
@@ -535,6 +577,149 @@ impl Workspace {
                 self.status = format!("Saved {}", entry.name);
             }
         }
+        cx.notify();
+    }
+
+    /// What the form says, checked: the entry (no id yet), its parsed
+    /// setup, and the secrets typed (`None` = left empty). `Err` = why not.
+    fn read_form(&self, cx: &App) -> Result<(ReadForm, ConnSetup), String> {
+        let read = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
+        let name = read(&self.form.name);
+        let host = read(&self.form.host);
+        let user = read(&self.form.user);
+        let dbname = read(&self.form.db);
+        let port = read(&self.form.port).parse().unwrap_or(5432);
+        let ssl = read(&self.form.ssl);
+        let init_sql = self.form.init_sql.read(cx).value().trim().to_string();
+        let params_text = self.form.params.read(cx).value().to_string();
+        let password = self.form.password.read(cx).value().to_string();
+        let ssh_secret = self.form.ssh_secret.read(cx).value().to_string();
+
+        if name.is_empty() || host.is_empty() || user.is_empty() || dbname.is_empty() {
+            return Err("Fill name, host, user, and database".into());
+        }
+        let setup =
+            ConnSetup::parse(&params_text, &init_sql).map_err(|e| format!("Parameters, {e}"))?;
+        let ssh = if self.form.ssh {
+            let (host, user) = (read(&self.form.ssh_host), read(&self.form.ssh_user));
+            if host.is_empty() || user.is_empty() {
+                return Err("Fill the SSH host and user".into());
+            }
+            let auth = self.form.ssh_auth;
+            Some(SshEntry {
+                host,
+                port: read(&self.form.ssh_port).parse().unwrap_or(22),
+                user,
+                auth,
+                key_file: match auth {
+                    SshAuthKind::Key => read(&self.form.ssh_key),
+                    _ => String::new(),
+                },
+            })
+        } else {
+            None
+        };
+        let ssh_secret = ssh
+            .as_ref()
+            .filter(|s| s.auth != SshAuthKind::Agent && !ssh_secret.is_empty())
+            .map(|_| ssh_secret);
+        let entry = ConnectionEntry {
+            id: String::new(),
+            name,
+            host,
+            port,
+            dbname,
+            user,
+            ssl_mode: if ssl.is_empty() { "prefer".into() } else { ssl },
+            params: param_lines(&params_text),
+            init_sql,
+            ssh,
+        };
+        let password = (!password.is_empty()).then_some(password);
+        Ok((
+            ReadForm {
+                entry,
+                password,
+                ssh_secret,
+            },
+            setup,
+        ))
+    }
+
+    /// The form's Test: connect once with what it says (the saved secrets of
+    /// the entry being edited where none were typed), report the server
+    /// version or the error above the buttons, and close again.
+    pub(super) fn test_connection(&mut self, cx: &mut Context<Self>) {
+        let (form, setup) = match self.read_form(cx) {
+            Ok(read) => read,
+            Err(msg) => {
+                self.form.test = Some(Err(msg));
+                cx.notify();
+                return;
+            }
+        };
+        // Secrets not typed: the edited entry's, saved under its OLD name.
+        let saved_name = self.form.editing.as_ref().and_then(|id| {
+            self.settings
+                .connections
+                .iter()
+                .find(|c| &c.id == id)
+                .map(|c| c.name.clone())
+        });
+        let cached = |account: Option<String>| {
+            account
+                .as_ref()
+                .and_then(|a| self.passwords.get(a).cloned())
+        };
+        let pw = form.password.clone().or_else(|| cached(saved_name.clone()));
+        let wants_ssh_secret = form
+            .entry
+            .ssh
+            .as_ref()
+            .is_some_and(|s| s.auth != SshAuthKind::Agent);
+        let ssh_secret = form
+            .ssh_secret
+            .clone()
+            .or_else(|| cached(saved_name.as_deref().map(ssh_account)));
+        let mut cfg = entry_config(&form.entry, pw, ssh_secret);
+        cfg.setup = setup;
+        cfg.connect_timeout = connect_timeout(&self.settings);
+        let lookup = |account: Option<String>| {
+            account.map(|a| {
+                cx.background_spawn(async move { skimrow_config::secret::get_password(&a) })
+            })
+        };
+        let pw_task = lookup(saved_name.clone().filter(|_| cfg.password.is_none()));
+        let ssh_task =
+            lookup(saved_name.as_deref().map(ssh_account).filter(|_| {
+                wants_ssh_secret && cfg.ssh.as_ref().is_some_and(|s| s.secret.is_none())
+            }));
+        self.form.test_gen += 1;
+        let gen = self.form.test_gen;
+        self.form.testing = true;
+        self.form.test = None;
+        let db = self.db.clone();
+        let fut = async move {
+            if let Some(task) = pw_task {
+                cfg.password = task.await;
+            }
+            if let (Some(task), Some(ssh)) = (ssh_task, &mut cfg.ssh) {
+                ssh.secret = task.await;
+            }
+            db.test(cfg).await
+        };
+        self.spawn_db(cx, fut, move |this, result, _| {
+            // Not if the form was reopened or tested again meanwhile.
+            if this.form.test_gen != gen {
+                return;
+            }
+            this.form.testing = false;
+            this.form.test = Some(result.map_err(|e| match e {
+                // The line already says "Connection failed".
+                DbError::Connect(why) => why,
+                e => e.to_string(),
+            }));
+        });
         cx.notify();
     }
 
@@ -653,7 +838,15 @@ impl Workspace {
         }
     }
 
-    pub(super) fn start_connect(&mut self, cfg: ConnectionConfig, cx: &mut Context<Self>) {
+    /// Connect with `cfg` — abandoning a connect still in flight (the latest
+    /// one asked for wins). Stored passwords are read first, off the UI
+    /// thread; the sidebar shows the loader (`Connecting`) until the schema
+    /// list is in, or the error with Retry.
+    pub(super) fn start_connect(&mut self, mut cfg: ConnectionConfig, cx: &mut Context<Self>) {
+        self.connect_gen += 1;
+        let gen = self.connect_gen;
+        self.connect_error = None;
+        cfg.connect_timeout = connect_timeout(&self.settings);
         self.status = format!("Connecting to {}…", cfg.name);
         let db = self.db.clone();
         let key = self.conn_key.clone();
@@ -673,7 +866,13 @@ impl Workspace {
                 let account = ssh_account(&cfg.name);
                 cx.background_spawn(async move { skimrow_config::secret::get_password(&account) })
             });
-        let fut = async move {
+        let phase = if pw_task.is_some() || ssh_task.is_some() {
+            ConnPhase::Keychain
+        } else {
+            ConnPhase::Server
+        };
+        let name = cfg.name.clone();
+        let task = cx.spawn(async move |this, cx| {
             let mut cfg = cfg;
             if let Some(task) = pw_task {
                 cfg.password = task.await;
@@ -681,34 +880,108 @@ impl Workspace {
             if let (Some(task), Some(ssh)) = (ssh_task, &mut cfg.ssh) {
                 ssh.secret = task.await;
             }
+            let (mut phases, opening) = db.open_watched(cfg.clone());
+            // The phases, while it opens; dropped (stopped) with this task.
+            let weak = this.clone();
+            let _phases = cx.spawn(async move |cx| {
+                while let Some(phase) = phases.recv().await {
+                    weak.update(cx, |this, cx| this.set_connect_phase(gen, phase.into(), cx))
+                        .ok();
+                }
+            });
+            let result = opening.await;
             // Kept, with the resolved passwords: it configures the completion
             // server, or is connected again once a new SSH host key is trusted.
-            (db.open(cfg.clone()).await, cfg)
-        };
-        self.spawn_db(cx, fut, move |this, (result, cfg), cx| match result {
+            this.update(cx, |this, cx| {
+                this.connect_done(gen, key, result, cfg, cx);
+                cx.notify();
+            })
+            .ok();
+        });
+        // Replacing a connect in flight drops (abandons) it.
+        self.connecting = Some(Connecting {
+            gen,
+            name,
+            phase,
+            since: Instant::now(),
+            task: Some(task),
+        });
+        cx.notify();
+    }
+
+    fn set_connect_phase(&mut self, gen: u64, phase: ConnPhase, cx: &mut Context<Self>) {
+        if let Some(c) = self.connecting.as_mut().filter(|c| c.gen == gen) {
+            c.phase = phase;
+            cx.notify();
+        }
+    }
+
+    /// A connect is over. One that was abandoned or replaced meanwhile is
+    /// closed again, never applied.
+    fn connect_done(
+        &mut self,
+        gen: u64,
+        key: Option<String>,
+        result: Result<Connected, DbError>,
+        cfg: ConnectionConfig,
+        cx: &mut Context<Self>,
+    ) {
+        if gen != self.connect_gen {
+            if let Ok(stale) = result {
+                self.db.disconnect(stale.id);
+            }
+            return;
+        }
+        // This runs inside that task: let it finish rather than dropping it.
+        if let Some(task) = self.connecting.as_mut().and_then(|c| c.task.take()) {
+            task.detach();
+        }
+        match result {
             Ok(connected) => {
                 let conn = connected.id;
                 log(format!("connected (conn={conn})"));
-                this.conn = Some(conn);
-                this.db.set_pool_size(conn, this.settings.pool_size);
+                self.conn = Some(conn);
+                self.db.set_pool_size(conn, self.settings.pool_size);
                 // Not if the user has moved on to another connection meanwhile.
-                this.pending_restore = !this.session_ready && this.conn_key == key;
-                this.status = "Connected. Loading schemas…".into();
-                this.start_lsp(&lsp_config(&cfg, connected.local));
-                this.load_schemas(cx);
+                self.pending_restore = !self.session_ready && self.conn_key == key;
+                self.status = "Connected. Loading schemas…".into();
+                if let Some(c) = &mut self.connecting {
+                    c.phase = ConnPhase::Schemas;
+                }
+                self.start_lsp(&lsp_config(&cfg, connected.local), cx);
+                self.load_schemas(cx);
             }
             Err(e) => {
                 log(format!("connect failed: {e}"));
-                this.status = format!("Connection failed: {e}");
+                self.connecting = None;
+                self.status = format!("Connection failed: {e}");
+                self.connect_error = Some(match &e {
+                    // Already says what failed.
+                    DbError::Connect(why) => why.clone(),
+                    e => e.to_string(),
+                });
                 // Ask whether to trust it — unless the user has moved on.
                 if let DbError::UnknownHostKey(host_key) = e {
-                    if this.conn.is_none() && this.conn_key == key {
-                        this.host_key = Some((host_key, cfg));
-                        this.modal = Some(Modal::TrustHostKey);
+                    if self.conn.is_none() && self.conn_key == key {
+                        self.host_key = Some((host_key, cfg));
+                        self.modal = Some(Modal::TrustHostKey);
                     }
                 }
             }
-        });
+        }
+    }
+
+    /// The connecting loader's Cancel: abandon the connect (the worker stops
+    /// dialing) and say so where it was.
+    pub(super) fn cancel_connect(&mut self, cx: &mut Context<Self>) {
+        if self.connecting.as_ref().is_none_or(|c| c.connected()) {
+            return;
+        }
+        self.connecting = None;
+        self.connect_gen += 1;
+        self.connect_error = Some("Cancelled".into());
+        self.status = "Connect cancelled".into();
+        cx.notify();
     }
 
     /// The host-key dialog's "Trust": record the SSH server's key in skimrow's
@@ -766,21 +1039,29 @@ impl Workspace {
 
     /// (Re)start the bundled `sqls` server for the just-connected database, so
     /// SQL editors get schema-aware completion. Best-effort: if `sqls` isn't
-    /// bundled/installed we log and carry on with no completion.
-    pub(super) fn start_lsp(&mut self, cfg: &ConnectionConfig) {
+    /// bundled/installed we log and carry on with no completion. Finding it
+    /// (a PATH scan) and spawning it happen off the UI thread; a server started
+    /// for a connection that has been replaced meanwhile is dropped (killed).
+    pub(super) fn start_lsp(&mut self, cfg: &ConnectionConfig, cx: &mut Context<Self>) {
         // Drop any previous server (kills the process) before starting a new one.
         *self.lsp_slot.borrow_mut() = None;
-        let Some(exe) = lsp::sqls_path() else {
-            log("sqls not found; SQL completion disabled");
-            return;
-        };
-        match lsp::LspHandle::spawn(&exe, cfg) {
-            Ok(h) => {
-                *self.lsp_slot.borrow_mut() = Some(h);
+        self.lsp_gen += 1;
+        let gen = self.lsp_gen;
+        let cfg = cfg.clone();
+        let spawned = cx.background_spawn(async move {
+            let Some(exe) = lsp::sqls_path() else {
+                return Err("sqls not found; SQL completion disabled".to_string());
+            };
+            lsp::LspHandle::spawn(&exe, &cfg).map_err(|e| format!("sqls spawn failed: {e}"))
+        });
+        self.spawn_db(cx, spawned, move |this, spawned, _| match spawned {
+            Ok(h) if this.lsp_gen == gen => {
+                *this.lsp_slot.borrow_mut() = Some(h);
                 log("sqls started");
             }
-            Err(e) => log(format!("sqls spawn failed: {e}")),
-        }
+            Ok(_) => {}
+            Err(e) => log(e),
+        });
     }
 }
 
@@ -1149,5 +1430,209 @@ mod tests {
                 assert!(!ws.conn_adding && ws.is_modal(Modal::Connections));
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn testing_a_connection_reports_above_the_buttons(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (db, mut unserved) = DbHandle::unserved();
+        let window =
+            cx.add_window(|window, cx| Workspace::new(db, Settings::default(), None, window, cx));
+        // Missing fields: refused at once, nothing sent.
+        window
+            .update(cx, |ws, window, cx| {
+                ws.show_add_form(window, cx);
+                ws.test_connection(cx);
+                assert!(!ws.form.testing);
+                assert!(matches!(&ws.form.test, Some(Err(e)) if e.starts_with("Fill")));
+                let form = &ws.form;
+                for (input, text) in [(&form.name, "t"), (&form.user, "u"), (&form.db, "d")] {
+                    type_into(input, text, window, cx);
+                }
+                ws.test_connection(cx);
+                assert!(ws.form.testing && ws.form.test.is_none());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        unserved.refuse_all();
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _, cx| {
+                assert!(!ws.form.testing);
+                assert!(matches!(&ws.form.test, Some(Err(e)) if e.contains("refused")));
+                ws.test_connection(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        unserved.pass_tests("PostgreSQL 16.4");
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, window, cx| {
+                assert_eq!(ws.form.test, Some(Ok("PostgreSQL 16.4".into())));
+                // Nothing was saved or connected by testing.
+                assert!(ws.settings.connections.is_empty() && ws.conn.is_none());
+                // Reopening the form forgets it, and drops a late answer.
+                ws.test_connection(cx);
+                ws.show_add_form(window, cx);
+                assert!(ws.form.test.is_none() && !ws.form.testing);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        unserved.pass_tests("PostgreSQL 16.4");
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _, _| assert!(ws.form.test.is_none()))
+            .unwrap();
+    }
+
+    /// A saved connection whose password is already known (no keychain read).
+    fn connect_with_cached_password(ws: &mut Workspace, idx: usize, cx: &mut Context<Workspace>) {
+        let name = ws.settings.connections[idx].name.clone();
+        ws.passwords.insert(name, "pw".into());
+        ws.connect_saved(idx, cx);
+    }
+
+    /// A connect shows the sidebar loader with its phase, and Cancel
+    /// abandons it: a result that still comes back is dropped.
+    #[gpui::test]
+    fn connecting_shows_its_phase_and_cancels(cx: &mut TestAppContext) {
+        let (window, mut unserved) = unserved_workspace(cx);
+        window
+            .update(cx, |ws, _w, cx| {
+                ws.settings.connections.push(saved("id-a", "a"));
+                connect_with_cached_password(ws, 0, cx);
+                let connecting = ws.connecting.as_ref().expect("connecting");
+                assert_eq!(connecting.phase, ConnPhase::Server);
+                assert_eq!(connecting.label(), "Connecting to a");
+                assert!(!connecting.connected());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(unserved.report_phase(ConnectPhase::SshTunnel), 1);
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _w, cx| {
+                assert_eq!(
+                    ws.connecting.as_ref().map(|c| c.phase),
+                    Some(ConnPhase::SshTunnel)
+                );
+                ws.cancel_connect(cx);
+                assert!(ws.connecting.is_none());
+                assert_eq!(ws.connect_error.as_deref(), Some("Cancelled"));
+            })
+            .unwrap();
+        // The abandoned connect is answered anyway: nobody's listening.
+        assert_eq!(unserved.accept_connects(7), 1);
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _w, _| assert_eq!(ws.conn, None))
+            .unwrap();
+    }
+
+    /// Clicking another connection while one connects: the latest wins, and
+    /// the first one's result never takes over.
+    #[gpui::test]
+    fn latest_connect_wins(cx: &mut TestAppContext) {
+        let (window, mut unserved) = unserved_workspace(cx);
+        window
+            .update(cx, |ws, _w, cx| {
+                ws.settings.connections.push(saved("id-a", "a"));
+                ws.settings.connections.push(saved("id-b", "b"));
+                connect_with_cached_password(ws, 0, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _w, cx| connect_with_cached_password(ws, 1, cx))
+            .unwrap();
+        cx.run_until_parked();
+        // Both connects reached the worker; ids 1 (a, abandoned) and 2 (b).
+        assert_eq!(unserved.accept_connects(1), 2);
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _w, _| {
+                assert_eq!(ws.conn, Some(2));
+                assert_eq!(ws.cfg.as_ref().map(|c| c.name.as_str()), Some("b"));
+                // Connected; the sidebar loader stays for the schema list.
+                let connecting = ws.connecting.as_ref().expect("loading schemas");
+                assert!(connecting.connected());
+                assert_eq!(connecting.label(), "Loading schemas");
+            })
+            .unwrap();
+    }
+
+    /// A failed connect leaves the reason in the sidebar (with Retry), and
+    /// the loader goes.
+    #[gpui::test]
+    fn failed_connect_shows_why(cx: &mut TestAppContext) {
+        let (window, mut unserved) = unserved_workspace(cx);
+        window
+            .update(cx, |ws, _w, cx| {
+                ws.settings.connections.push(saved("id-a", "a"));
+                connect_with_cached_password(ws, 0, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        unserved.fail_all(DbError::Timeout(Duration::from_secs(30)));
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _w, cx| {
+                assert!(ws.connecting.is_none());
+                assert_eq!(
+                    ws.connect_error.as_deref(),
+                    Some("connection timed out after 30s")
+                );
+                // Retry connects again, the error gone meanwhile.
+                ws.connect_or_refresh(cx);
+                assert!(ws.connecting.is_some() && ws.connect_error.is_none());
+            })
+            .unwrap();
+    }
+
+    /// The connect deadline comes from Settings (0 = none).
+    #[test]
+    fn connect_timeout_follows_settings() {
+        let mut settings = Settings::default();
+        assert_eq!(connect_timeout(&settings), Some(Duration::from_secs(30)));
+        settings.connect_timeout_secs = 0;
+        assert_eq!(connect_timeout(&settings), None);
+    }
+
+    /// The schema list failing after a connect ends the loader and leaves an
+    /// error row under the database that loads it again.
+    #[gpui::test]
+    fn schema_list_failure_leaves_a_retry_row(cx: &mut TestAppContext) {
+        let (window, mut unserved) = unserved_workspace(cx);
+        window
+            .update(cx, |ws, _w, cx| {
+                ws.settings.connections.push(saved("id-a", "a"));
+                connect_with_cached_password(ws, 0, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        unserved.accept_connects(1);
+        cx.run_until_parked();
+        assert_eq!(unserved.pending_jobs(), 1, "the schema list");
+        unserved.fail_jobs(DbError::Query("boom".into()));
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _w, cx| {
+                assert!(ws.connecting.is_none());
+                assert!(!ws.tree.schemas_loading);
+                assert!(ws.tree.failed.contains_key("db"));
+                let fail = SharedString::from("fail\u{1}db");
+                assert!(matches!(
+                    ws.tree.meta.get(&fail),
+                    Some(NodeMeta::Failed {
+                        retry: tree::TreeLoad::Schemas,
+                        ..
+                    })
+                ));
+                ws.retry_tree_load(tree::TreeLoad::Schemas, cx);
+                assert!(ws.tree.schemas_loading && ws.tree.failed.is_empty());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(unserved.pending_jobs(), 1, "loading the list again");
     }
 }
