@@ -7136,7 +7136,7 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "skimrow-app"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -7156,7 +7156,7 @@ dependencies = [
 
 [[package]]
 name = "skimrow-config"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -7168,7 +7168,7 @@ dependencies = [
 
 [[package]]
 name = "skimrow-db"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "futures-util",
