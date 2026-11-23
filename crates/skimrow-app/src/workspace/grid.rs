@@ -29,6 +29,12 @@ use crate::lsp::{self, LspSlot, SqlCompletion};
 const EDITED_BG: u32 = 0x3b82f666;
 const EDITED_BAR: u32 = 0x2563ebff;
 const EDITED_HOVER: u32 = 0x2563eb99;
+/// Whole-row tints for staged row changes, diff-style: light red for a row
+/// staged for DELETE, light green for a row added in the grid (new / INSERT).
+const DELETED_BG: u32 = 0xef444433;
+const DELETED_HOVER: u32 = 0xef444455;
+const ADDED_BG: u32 = 0x22c55e33;
+const ADDED_HOVER: u32 = 0x22c55e55;
 /// Outline of the keyboard cell cursor (drawn only while the grid has focus).
 const CURSOR_RING: u32 = 0x2563ebff;
 
@@ -310,13 +316,18 @@ impl TableDelegate for ResultDelegate {
         // it selects the row like any other cell.
         if col_ix == ROWNUM_COL {
             let weak = self.ws.clone();
-            let first = weak
+            let (first, tint) = weak
                 .upgrade()
-                .and_then(|ws| ws.read(cx).tab(tab_id).map(|t| t.first_row))
-                .unwrap_or(0);
+                .and_then(|ws| {
+                    ws.read(cx)
+                        .tab(tab_id)
+                        .map(|t| (t.first_row, row_tint(t, row_ix)))
+                })
+                .unwrap_or((0, None));
             return div()
                 .id(SharedString::from(format!("rownum-{row_ix}")))
                 .size_full()
+                .when_some(tint, |d, (bg, _)| d.bg(rgba(bg)))
                 .flex()
                 .items_center()
                 .justify_end()
@@ -348,6 +359,7 @@ impl TableDelegate for ResultDelegate {
         let editing = tab.editing == Some((row_ix, col_ix));
         let editable = tab.edit_cols.get(col_ix).is_some_and(|o| o.is_some());
         let edited = tab.edited_cells.contains(&(row_ix, col_ix));
+        let tint = row_tint(tab, row_ix);
         let cell_input = ws.cell_input.clone();
         // The keyboard cursor: an outline, and only while the grid itself holds
         // focus (the row highlight is what stays when focus moves elsewhere).
@@ -407,7 +419,11 @@ impl TableDelegate for ResultDelegate {
                 // The bar is an ABSOLUTE overlay, not `border_l_2`: a real border
                 // takes part in layout and shifted the cell text 2px right, which
                 // was plainly visible next to unedited rows.
-                .when(edited, |d| {
+                // A deleted / added row's tint wins over the per-cell marker.
+                .when_some(tint, |d, (bg, hover)| {
+                    d.bg(rgba(bg)).hover(move |s| s.bg(rgba(hover)))
+                })
+                .when(edited && tint.is_none(), |d| {
                     d.bg(rgba(EDITED_BG))
                         .hover(|s| s.bg(rgba(EDITED_HOVER)))
                         .child(
@@ -420,7 +436,7 @@ impl TableDelegate for ResultDelegate {
                                 .bg(rgba(EDITED_BAR)),
                         )
                 })
-                .when(!edited, |d| d.hover(|s| s.bg(c.hover)))
+                .when(!edited && tint.is_none(), |d| d.hover(|s| s.bg(c.hover)))
                 .cursor_pointer()
                 .child(base)
                 .children(cursor)
@@ -441,6 +457,7 @@ impl TableDelegate for ResultDelegate {
             // any result, not just editable ones).
             let weak = self.ws.clone();
             base.id(SharedString::from(format!("cell-{row_ix}-{col_ix}")))
+                .when_some(tint, |d, (bg, _)| d.bg(rgba(bg)))
                 .relative()
                 .child(sep_line(c))
                 .children(cursor)
@@ -450,6 +467,19 @@ impl TableDelegate for ResultDelegate {
                 })
                 .into_any_element()
         }
+    }
+}
+
+/// The (fill, hover) tint of a whole row with a staged row change: red for a
+/// staged DELETE, green for a row added in the grid (past the loaded rows —
+/// the unsaved new row and staged INSERTs).
+pub(crate) fn row_tint(tab: &Tab, row: usize) -> Option<(u32, u32)> {
+    if tab.deleted_rows.contains(&row) {
+        Some((DELETED_BG, DELETED_HOVER))
+    } else if row >= tab.orig_rows.len() && row < tab.rows.len() {
+        Some((ADDED_BG, ADDED_HOVER))
+    } else {
+        None
     }
 }
 
@@ -623,6 +653,9 @@ pub(crate) struct Tab {
     pub(crate) new_row_idx: Option<usize>,
     pub(crate) pending: Vec<RowEdit>,
     pub(crate) edited_cells: HashSet<(usize, usize)>,
+    /// Rows with a staged DELETE (tinted red; pressing − again unstages it).
+    /// Cleared wherever `edited_cells` is.
+    pub(crate) deleted_rows: HashSet<usize>,
 
     pub(crate) running: bool,
     /// What the run waits for, and since when (the loader's label).
@@ -944,6 +977,7 @@ impl Tab {
             new_row_idx: None,
             pending: Vec::new(),
             edited_cells: HashSet::new(),
+            deleted_rows: HashSet::new(),
             running: false,
             busy: Busy::Running,
             busy_since: Instant::now(),

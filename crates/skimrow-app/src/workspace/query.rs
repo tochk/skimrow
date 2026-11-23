@@ -438,6 +438,7 @@ impl Workspace {
             tab.editing = None;
             tab.pending.clear();
             tab.edited_cells.clear();
+            tab.deleted_rows.clear();
             tab.plan = None;
         }
         // The cell cursor is deliberately left alone: `run_sql` clamps it to the

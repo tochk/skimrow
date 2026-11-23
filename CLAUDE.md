@@ -460,7 +460,12 @@ The WSL host can run Windows exes directly:
   `render_td` branches (before the dirty gutter, so that paints over it). Left edge,
   not right: the widget pads the header's inner flex on the right (`offset_pr`), so a
   right-edge rule would sit 8px off from the body's. `edited_cells:
-  HashSet<(row,col)>` tracks them, cleared whenever `pending` is. `orig_rows` snapshots
+  HashSet<(row,col)>` tracks them, cleared whenever `pending` is. **Row changes tint the
+  whole row** (`grid.rs::row_tint`, gutter included, wins over the blue cell marker): light
+  red = staged DELETE (`Tab.deleted_rows`, cleared with `edited_cells`), light green = a row
+  past the loaded ones (`row >= orig_rows.len()`: the new row / staged INSERTs). − on a row
+  already staged for deletion UNSTAGES that DELETE (`delete_current_row`), never twice.
+  `orig_rows` snapshots
   the loaded values: editing a cell back to its original drops the staged `Update`
   (`remove_pending_update`, which also dedups re-edits of the same cell) and unmarks it.
   **Commit rules**: Enter, Tab, blur, moving to another cell, and switching tabs

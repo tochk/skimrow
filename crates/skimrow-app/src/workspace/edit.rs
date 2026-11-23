@@ -343,7 +343,9 @@ impl Workspace {
         self.stage(tab_id, RowEdit::Insert { values }, &target, cx);
     }
 
-    /// Stage a DELETE for the selected row, or discard the unsaved new row.
+    /// Stage a DELETE for the selected row, or discard the unsaved new row. On a
+    /// row already staged for deletion it unstages that DELETE instead (a row
+    /// can't be deleted twice).
     pub(super) fn delete_current_row(&mut self, tab_id: u64, cx: &mut Context<Self>) {
         let Some(row) = self.tab(tab_id).and_then(|t| t.current_row) else {
             return;
@@ -371,7 +373,36 @@ impl Workspace {
         let Some(pk) = self.row_pk(tab_id, row, &target) else {
             return;
         };
-        self.stage(tab_id, RowEdit::Delete { pk }, &target, cx);
+        if self
+            .tab(tab_id)
+            .is_some_and(|t| t.deleted_rows.contains(&row))
+        {
+            let n = {
+                let Some(tab) = self.tab_mut(tab_id) else {
+                    return;
+                };
+                tab.pending
+                    .retain(|e| !matches!(e, RowEdit::Delete { pk: p } if *p == pk));
+                tab.deleted_rows.remove(&row);
+                tab.pending.len()
+            };
+            self.status = match n {
+                0 => "Deletion undone — nothing staged".into(),
+                n => format!(
+                    "Deletion undone — {n} change{} staged",
+                    if n == 1 { "" } else { "s" }
+                ),
+            };
+            self.refresh_table(tab_id, cx);
+            cx.notify();
+            return;
+        }
+        if self.stage(tab_id, RowEdit::Delete { pk }, &target, cx) {
+            if let Some(tab) = self.tab_mut(tab_id) {
+                tab.deleted_rows.insert(row);
+            }
+            self.refresh_table(tab_id, cx);
+        }
     }
 
     pub(super) fn refresh_table(&mut self, tab_id: u64, cx: &mut Context<Self>) {
@@ -388,23 +419,23 @@ impl Workspace {
     }
 
     /// Add an edit to the tab's staged batch. Edits accumulate across the table
-    /// and are all applied in one transaction on Apply.
+    /// and are all applied in one transaction on Apply. False = not staged.
     pub(super) fn stage(
         &mut self,
         tab_id: u64,
         edit: RowEdit,
         target: &EditTarget,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         // Validate the statement builds before queueing it.
         if let Err(e) = edit.to_sql(target) {
             self.status = format!("Cannot build statement: {e}");
             cx.notify();
-            return;
+            return false;
         }
         let n = {
             let Some(tab) = self.tab_mut(tab_id) else {
-                return;
+                return false;
             };
             tab.pending.push(edit);
             tab.pending.len()
@@ -414,6 +445,7 @@ impl Workspace {
             if n == 1 { "" } else { "s" }
         );
         cx.notify();
+        true
     }
 
     /// The statements a tab's staged changes run, as shown for review before
@@ -475,6 +507,7 @@ impl Workspace {
             };
             tab.pending.clear();
             tab.edited_cells.clear();
+            tab.deleted_rows.clear();
             tab.last_sql.clone()
         };
         self.status = "Edits discarded".into();
@@ -546,6 +579,7 @@ impl Workspace {
                             tab.pending.clear();
                         }
                         tab.edited_cells.clear();
+                        tab.deleted_rows.clear();
                         // Rows came or went: the pager's count is stale.
                         if edits.iter().any(|e| !matches!(e, RowEdit::Update { .. })) {
                             tab.total_rows = None;
@@ -665,6 +699,51 @@ mod tests {
                 assert_eq!(ws.tab(id).unwrap().rows.len(), 1);
                 assert!(ws.tab(id).unwrap().new_row_idx.is_none());
                 assert!(ws.tab(id).unwrap().pending.is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn second_delete_unstages_it(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                seed_rows(ws, id, vec!["id", "name"], 3, cx);
+                editable_tab(ws, id, vec!["id", "name"]);
+                ws.set_cursor(id, 1, 0, cx);
+                ws.delete_current_row(id, cx);
+                let tab = ws.tab(id).unwrap();
+                assert_eq!(tab.pending.len(), 1);
+                assert!(tab.deleted_rows.contains(&1));
+                assert!(crate::workspace::grid::row_tint(tab, 1).is_some());
+                assert!(crate::workspace::grid::row_tint(tab, 0).is_none());
+
+                // Pressed again on the same row: no second DELETE, the first goes.
+                ws.delete_current_row(id, cx);
+                let tab = ws.tab(id).unwrap();
+                assert!(tab.pending.is_empty());
+                assert!(tab.deleted_rows.is_empty());
+                assert!(crate::workspace::grid::row_tint(tab, 1).is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn added_row_is_tinted(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                seed_rows(ws, id, vec!["id"], 2, cx);
+                editable_tab(ws, id, vec!["id"]);
+                ws.add_row(id, cx);
+                ws.tab_mut(id).unwrap().deleted_rows.insert(0);
+                let tab = ws.tab(id).unwrap();
+                let tint = crate::workspace::grid::row_tint;
+                assert!(tint(tab, 2).is_some(), "the new row");
+                assert!(tint(tab, 1).is_none(), "a loaded row");
+                assert_ne!(tint(tab, 2), tint(tab, 0), "added ≠ deleted color");
             })
             .unwrap();
     }
