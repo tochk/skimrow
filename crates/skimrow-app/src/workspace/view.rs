@@ -682,12 +682,19 @@ impl Workspace {
         }
         results = results.children(Self::render_run_error(tab, c, cx));
         // The results area shows the grid, or — after EXPLAIN — the plan text in
-        // that same place (query data vs. plan, same spot). A running query
+        // that same place (query data vs. plan, same spot). On a Query / Scratch
+        // tab the statements that returned no rows list their messages there
+        // (above the grid, if a later one did return rows). A running query
         // puts its loader over it.
+        let grid = tab.plan.is_none() && tab.shows_grid();
         let shown = if let Some(plan) = &tab.plan {
             Self::plan_view(tab_id, plan, tab.plan_analyze, c, cx).into_any_element()
+        } else if !grid {
+            fill(v_flex())
+                .children(Self::render_messages(tab, true, c, cx))
+                .into_any_element()
         } else {
-            fill(div())
+            let grid = fill(div())
                 .debug_selector(|| "result-grid".into())
                 .overflow_hidden()
                 .key_context(grid_context)
@@ -705,7 +712,11 @@ impl Workspace {
                         cx.stop_propagation();
                     }),
                 )
-                .child(DataTable::new(&tab.table).stripe(true).bordered(true))
+                .child(DataTable::new(&tab.table).stripe(true).bordered(true));
+            fill(v_flex())
+                .overflow_hidden()
+                .children(Self::render_messages(tab, false, c, cx))
+                .child(grid)
                 .into_any_element()
         };
         let loader = tab.loader();
@@ -719,11 +730,12 @@ impl Workspace {
         );
 
         // Table tabs hide the redundant generated `SELECT *` editor and let the
-        // rows fill the pane; Query / Scratch keep the editor above the results.
+        // rows fill the pane; Query / Scratch keep the editor above the results
+        // — once there are any: until then the editor has the whole tab.
         let body = if matches!(tab.kind, TabKind::Table { .. }) {
             results.into_any_element()
         } else {
-            Self::editor_split(tab, results, c, cx).into_any_element()
+            Self::editor_split(tab, tab.has_output().then_some(results), c, cx).into_any_element()
         };
         let body = if tab.editing_multi {
             Self::value_split(tab, body, cell_multi, c, cx).into_any_element()
@@ -753,18 +765,32 @@ impl Workspace {
     /// the panes take `split : 1 - split` of the space left by the handle, and
     /// the editor grows into its pane. `layout_tests` sweeps window sizes to
     /// keep it that way.
+    ///
+    /// No `results` (nothing run yet, or nothing left to show): the editor
+    /// fills it all, no handle; the split comes back as it was with them.
     fn editor_split(
         tab: &Tab,
-        results: gpui::Div,
+        results: Option<gpui::Div>,
         c: Colors,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let tab_id = tab.id;
-        let split = tab.editor_split;
         let editor = Editor::new(&tab.editor)
             .flex_grow(1.)
             .flex_basis(px(0.))
             .min_h(px(0.));
+        let Some(results) = results else {
+            return fill(v_flex())
+                .debug_selector(|| "editor-split".into())
+                .overflow_hidden()
+                .child(
+                    fill(v_flex())
+                        .debug_selector(|| "editor-pane".into())
+                        .overflow_hidden()
+                        .child(editor),
+                );
+        };
+        let split = tab.editor_split;
         let handle = split_handle("editor-split-handle", c)
             .on_drag(EditorSplitDrag(tab_id), |drag, _, _, cx| {
                 cx.stop_propagation();
@@ -804,6 +830,110 @@ impl Workspace {
                     .overflow_hidden()
                     .child(results),
             )
+    }
+
+    /// The messages of a run's statements that returned no rows (`Tab.messages`):
+    /// one line each — what it was, what it did, how long it took — under a
+    /// header with a close button. `alone`: no grid under them, so they take
+    /// the whole results pane; above a grid they keep to a few lines and scroll.
+    fn render_messages(
+        tab: &Tab,
+        alone: bool,
+        c: Colors,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        if tab.messages.is_empty() {
+            return None;
+        }
+        let tab_id = tab.id;
+        let mut lines = v_flex().py_1();
+        for m in &tab.messages {
+            lines = lines.child(
+                h_flex()
+                    .px_3()
+                    .py(px(3.))
+                    .gap_2()
+                    .items_center()
+                    .text_sm()
+                    .child(
+                        Icon::empty()
+                            .path("icons/check.svg")
+                            .small()
+                            .text_color(rgba(0x22c55eff)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(c.fg)
+                            .child(m.tag.clone()),
+                    )
+                    .child(div().text_color(c.fg).child(m.outcome()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(c.fg_dim)
+                            .child(util::took(m.elapsed)),
+                    ),
+            );
+        }
+        let n = tab.messages.len();
+        let header = h_flex()
+            .flex_none()
+            .px_2()
+            .py_1()
+            .items_center()
+            .justify_between()
+            .bg(c.header)
+            .border_b_1()
+            .border_color(c.border)
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(c.fg_dim)
+                    .child(if n == 1 {
+                        "MESSAGES".to_string()
+                    } else {
+                        format!("MESSAGES · {n} statements")
+                    }),
+            )
+            .child(
+                Button::new("close-messages")
+                    .ghost()
+                    .xsmall()
+                    .tab_stop(false)
+                    .icon(Icon::empty().path("icons/close.svg"))
+                    .tooltip("Dismiss")
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.dismiss_messages(tab_id, cx)
+                    })),
+            );
+        let list = div()
+            .id("run-messages")
+            .overflow_y_scroll()
+            .map(|d| {
+                if alone {
+                    d.flex_1().min_h(px(0.))
+                } else {
+                    d.max_h(px(112.))
+                }
+            })
+            .child(lines);
+        Some(
+            v_flex()
+                .debug_selector(|| "run-messages".into())
+                .overflow_hidden()
+                .map(|d| {
+                    if alone {
+                        fill(d)
+                    } else {
+                        d.flex_none().border_b_1().border_color(c.border)
+                    }
+                })
+                .child(header)
+                .child(list),
+        )
     }
 
     /// Export: saves the result in the format picked in Settings.
@@ -3701,6 +3831,77 @@ mod layout_tests {
         }
     }
 
+    /// Nothing to show under the editor (nothing run yet, or a run whose
+    /// statements returned no rows and whose messages were dismissed): the
+    /// editor takes the whole tab. A statement without rows shows its message
+    /// there instead of an empty table.
+    #[gpui::test]
+    fn results_pane_only_with_something_to_show(cx: &mut TestAppContext) {
+        let handle = new_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle.into(), cx);
+        cx.simulate_resize(size(px(1400.), px(850.)));
+        let id = handle.update(cx, seed_query_tab).unwrap();
+        cx.run_until_parked();
+        let split = laid_out(cx, "editor-split");
+        let editor = laid_out(cx, "editor-pane");
+        assert!(near(editor.size.height, split.size.height));
+        assert!(cx.debug_bounds("results-pane").is_none());
+        let input = input_bounds(handle, cx);
+        assert!(near(input.size.height + INPUT_INSET, editor.size.height));
+
+        // An UPDATE ran: its message, no grid.
+        handle
+            .update(cx, |ws, _, cx| {
+                ws.tab_mut(id).unwrap().messages = vec![grid::RunMessage {
+                    tag: "UPDATE".into(),
+                    rows: Some(3),
+                    elapsed: std::time::Duration::from_millis(4),
+                }];
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let results = laid_out(cx, "results-pane");
+        let messages = laid_out(cx, "run-messages");
+        assert!(near(messages.size.height, results.size.height));
+        assert!(cx.debug_bounds("result-grid").is_none());
+
+        // Dismissed: the editor has it all again.
+        handle
+            .update(cx, |ws, _, cx| ws.dismiss_messages(id, cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("results-pane").is_none());
+
+        // A run going on shows its loader there, rows show the grid (and
+        // messages from the same run sit above it).
+        handle
+            .update(cx, |ws, _, cx| {
+                ws.begin_run(id, Busy::Running);
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("results-pane").is_some());
+        handle
+            .update(cx, |ws, _, cx| {
+                ws.tab_mut(id).unwrap().running = false;
+                seed_rows(ws, id, vec!["a"], 3, cx);
+                ws.tab_mut(id).unwrap().messages = vec![grid::RunMessage {
+                    tag: "DELETE".into(),
+                    rows: Some(1),
+                    elapsed: std::time::Duration::from_millis(1),
+                }];
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let messages = laid_out(cx, "run-messages");
+        let grid = laid_out(cx, "result-grid");
+        assert!(messages.bottom() <= grid.top() + px(1.));
+        assert!(grid.size.height > messages.size.height);
+    }
+
     #[test]
     fn value_size_counts_lines_and_chars() {
         assert_eq!(value_size(""), "NULL");
@@ -3714,7 +3915,13 @@ mod layout_tests {
         let handle = new_workspace(cx);
         let cx = &mut VisualTestContext::from_window(handle.into(), cx);
         cx.simulate_resize(size(px(1400.), px(850.)));
-        let id = handle.update(cx, seed_query_tab).unwrap();
+        let id = handle
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                seed_rows(ws, id, vec!["a"], 3, cx);
+                id
+            })
+            .unwrap();
         cx.run_until_parked();
         let split = laid_out(cx, "editor-split");
         handle

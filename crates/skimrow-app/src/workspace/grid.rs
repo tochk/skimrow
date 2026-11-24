@@ -698,6 +698,31 @@ pub(crate) struct Tab {
     /// The last run's failure, shown over the results until the next run
     /// (or its close button).
     pub(crate) run_error: Option<RunError>,
+    /// The last run's statements that returned no rows (UPDATE, CREATE…), one
+    /// line each under the editor, until the next result (or their close button).
+    pub(crate) messages: Vec<RunMessage>,
+}
+
+/// A statement of a run that returned no rows, as its line under the editor
+/// says it: `UPDATE  3 rows affected  4 ms`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RunMessage {
+    /// `UPDATE`, `CREATE TABLE`… (`util::command_tag`).
+    pub(crate) tag: String,
+    /// How many rows it changed, for the statements that count them.
+    pub(crate) rows: Option<u64>,
+    pub(crate) elapsed: std::time::Duration,
+}
+
+impl RunMessage {
+    /// What it did: `3 rows affected`, or `done`.
+    pub(crate) fn outcome(&self) -> String {
+        match self.rows {
+            Some(1) => "1 row affected".into(),
+            Some(n) => format!("{n} rows affected"),
+            None => "done".into(),
+        }
+    }
 }
 
 /// A failed run, as the error banner over the results shows it.
@@ -919,6 +944,25 @@ impl Tab {
         }
     }
 
+    /// Whether the grid is drawn: always on a Table tab (unless a plan is up);
+    /// on a Query / Scratch tab only for a result with columns — a statement
+    /// that returns no rows gets its message instead of an empty table.
+    pub(crate) fn shows_grid(&self) -> bool {
+        self.plan.is_none()
+            && (matches!(self.kind, TabKind::Table { .. }) || !self.headers.is_empty())
+    }
+
+    /// Whether a Query / Scratch tab has anything for the pane under its editor
+    /// — rows, a plan, an error, messages, or a run's loader. Without, the
+    /// editor takes the whole tab.
+    pub(crate) fn has_output(&self) -> bool {
+        !self.headers.is_empty()
+            || self.plan.is_some()
+            || self.run_error.is_some()
+            || !self.messages.is_empty()
+            || self.running
+    }
+
     /// The loader to draw: from the moment a run starts until it is over.
     pub(crate) fn loader(&self) -> Option<Loader> {
         if !self.running {
@@ -993,6 +1037,7 @@ impl Tab {
             editor_run: None,
             clause_error: None,
             run_error: None,
+            messages: Vec::new(),
         }
     }
 

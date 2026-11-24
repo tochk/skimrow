@@ -35,31 +35,88 @@ impl QueryLog {
 /// Everything a finished query produced, drained from its event stream.
 #[derive(Default)]
 struct QueryOutcome {
+    /// The last result with columns (a submission of several statements
+    /// shows its last one).
     headers: Vec<String>,
     rows: Vec<Vec<CellValue>>,
+    /// Every statement that finished, in order.
+    done: Vec<Finished>,
+    /// The last statement's row count.
     affected: u64,
+    /// All of them together.
     elapsed: std::time::Duration,
     error: Option<DbError>,
     /// The tab's session is left inside a transaction.
     in_transaction: bool,
 }
 
+/// One statement of a submission, finished.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Finished {
+    /// It returned a result with columns (shown in the grid, not as a message).
+    columns: bool,
+    affected: u64,
+    elapsed: std::time::Duration,
+}
+
 /// Collect a query's whole event stream into one `QueryOutcome`.
 async fn drain_query(mut rx: skimrow_db::QueryStream) -> QueryOutcome {
     let mut out = QueryOutcome::default();
+    let mut columns = false;
     while let Some(ev) = rx.recv().await {
         match ev {
-            QueryEvent::Columns(c) => out.headers = c.iter().map(|m| m.name.clone()).collect(),
+            QueryEvent::Columns(c) => {
+                // A later result replaces an earlier one: its rows only.
+                out.headers = c.iter().map(|m| m.name.clone()).collect();
+                out.rows.clear();
+                columns = true;
+            }
             QueryEvent::Rows(mut r) => out.rows.append(&mut r),
             QueryEvent::Done { affected, elapsed } => {
+                out.done.push(Finished {
+                    columns: std::mem::take(&mut columns),
+                    affected,
+                    elapsed,
+                });
                 out.affected = affected;
-                out.elapsed = elapsed;
+                out.elapsed += elapsed;
             }
             QueryEvent::Failed(e) => out.error = Some(e),
             QueryEvent::Transaction(t) => out.in_transaction = t,
         }
     }
     out
+}
+
+/// The messages for the statements of `sql` that returned no rows, from what
+/// each reported (`done`, one per statement the server ran).
+fn run_messages(sql: &str, done: &[Finished]) -> Vec<grid::RunMessage> {
+    // Named by their own text when the split lines up with what the server
+    // ran (a body it splits differently, `BEGIN ATOMIC … END`, wouldn't).
+    let stmts = util::statements(sql);
+    let tags: Vec<String> = if stmts.len() == done.len() {
+        stmts.iter().map(|s| util::command_tag(s)).collect()
+    } else {
+        Vec::new()
+    };
+    done.iter()
+        .enumerate()
+        .filter(|(_, d)| !d.columns)
+        .map(|(i, d)| {
+            let tag = tags
+                .get(i)
+                .filter(|t| !t.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "Statement".into());
+            // `CREATE TABLE … AS` counts its rows too, under another tag.
+            let rows = (util::counts_rows(&tag) || d.affected > 0).then_some(d.affected);
+            grid::RunMessage {
+                tag,
+                rows,
+                elapsed: d.elapsed,
+            }
+        })
+        .collect()
 }
 
 impl Workspace {
@@ -138,8 +195,8 @@ impl Workspace {
 
     /// Run the active tab: a Table tab rebuilds its query from the CURRENT
     /// filter input (not the stale `base_sql`, which still holds the last
-    /// applied WHERE); a Query/Scratch tab runs the single statement under the
-    /// cursor (or the whole editor if there's one statement).
+    /// applied WHERE); a Query/Scratch tab runs the selected text, or with
+    /// nothing selected the single statement under the cursor.
     pub(super) fn run_active_tab(&mut self, cx: &mut Context<Self>) {
         // Ctrl/Cmd+Enter is also the multi-line cell editor's "save": while that
         // strip is open it saves the value instead of re-running the query (which
@@ -155,26 +212,25 @@ impl Workspace {
         {
             return;
         }
-        let (id, is_table, full, cursor) = {
-            let Some(tab) = self.active_tab() else { return };
-            let ed = tab.editor.read(cx);
-            (
-                tab.id,
-                matches!(tab.kind, TabKind::Table { .. }),
-                ed.value().to_string(),
-                ed.cursor(),
-            )
-        };
-        if is_table {
+        let Some(tab) = self.active_tab() else { return };
+        let id = tab.id;
+        if matches!(tab.kind, TabKind::Table { .. }) {
             self.apply_where(id, cx);
-        } else {
-            let range = util::statement_range(&full, cursor);
-            let stmt = full[range.clone()].to_string();
-            if let Some(tab) = self.tab_mut(id) {
-                tab.editor_run = Some((stmt.clone(), range.start));
-            }
+        } else if let Some(stmt) = self.editor_statement(id, cx) {
             self.run_new_query(id, stmt, cx);
         }
+    }
+
+    /// What Run / Explain take from `tab_id`'s editor (`util::run_range`: the
+    /// selection, else the statement under the cursor), remembered with its
+    /// place in the text so an error can be marked there.
+    fn editor_statement(&mut self, tab_id: u64, cx: &App) -> Option<String> {
+        let ed = self.tab(tab_id)?.editor.read(cx);
+        let full = ed.value().to_string();
+        let range = util::run_range(&full, ed.selected_range(), ed.cursor());
+        let stmt = full[range.clone()].to_string();
+        self.tab_mut(tab_id)?.editor_run = Some((stmt.clone(), range.start));
+        Some(stmt)
     }
 
     /// The SQL the active tab would run: a Table tab's generated `SELECT *`
@@ -206,18 +262,11 @@ impl Workspace {
         if self.refuse_if_running(id, cx) {
             return;
         }
-        // Like Run: the statement under the cursor, which an error is then
-        // marked in.
+        // Like Run: the selection or the statement under the cursor, which an
+        // error is then marked in.
         let sql = match self.active_tab() {
             Some(tab) if !matches!(tab.kind, TabKind::Table { .. }) => {
-                let ed = tab.editor.read(cx);
-                let full = ed.value().to_string();
-                let range = util::statement_range(&full, ed.cursor());
-                let stmt = full[range.clone()].to_string();
-                if let Some(tab) = self.tab_mut(id) {
-                    tab.editor_run = Some((stmt.clone(), range.start));
-                }
-                stmt
+                self.editor_statement(id, cx).unwrap_or_default()
             }
             _ => self.active_sql(cx).trim().trim_end_matches(';').to_string(),
         };
@@ -294,6 +343,15 @@ impl Workspace {
                 }
             }
         });
+        cx.notify();
+    }
+
+    /// The messages' close button: drop them (with no rows either, the editor
+    /// takes the whole tab again).
+    pub(super) fn dismiss_messages(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.messages.clear();
+        }
         cx.notify();
     }
 
@@ -451,6 +509,12 @@ impl Workspace {
     /// started (it queues behind that run on the tab's session, and is
     /// dropped with it).
     fn describe_async(&mut self, tab_id: u64, sql: String, cx: &mut Context<Self>) {
+        // Several statements (a selection run) are never editable, and the
+        // describe's prepare would fail on them — inside a transaction the run
+        // left open (`begin; update …`) that error would abort it.
+        if util::statements(&sql).len() != 1 {
+            return;
+        }
         let Some(session) = self.tab_session(tab_id) else {
             return;
         };
@@ -527,13 +591,16 @@ impl Workspace {
                 return;
             };
             tab.running = false;
-            // Marks from an earlier failure go, whatever this run did.
+            // Marks from an earlier failure go, whatever this run did; so do
+            // the last run's messages.
             tab.clause_error = None;
+            tab.messages.clear();
             let editor = tab.editor.clone();
             grid::clear_marks(&editor, cx);
             let QueryOutcome {
                 headers,
                 mut rows,
+                done,
                 affected,
                 elapsed,
                 error,
@@ -552,10 +619,18 @@ impl Workspace {
                 None => {
                     let is_select = !headers.is_empty();
                     let n = rows.len();
+                    let messages = run_messages(&logged, &done);
+                    let status = match &messages[..] {
+                        _ if is_select => format!("{n} row(s) in {elapsed:?}"),
+                        [one] => format!("{}: {} in {elapsed:?}", one.tag, one.outcome()),
+                        [] => format!("{affected} row(s) affected in {elapsed:?}"),
+                        many => format!("{} statements in {elapsed:?}", many.len()),
+                    };
                     let (table, cursor) = {
                         let Some(tab) = this.tab_mut(tab_id) else {
                             return;
                         };
+                        tab.messages = messages;
                         tab.headers = headers.clone();
                         tab.rows = rows.clone();
                         tab.orig_rows = rows.clone();
@@ -582,11 +657,7 @@ impl Workspace {
                         }
                     });
                     this.log.push(&logged, true);
-                    if is_select {
-                        format!("{n} row(s) in {elapsed:?}")
-                    } else {
-                        format!("{affected} row(s) affected in {elapsed:?}")
-                    }
+                    status
                 }
             };
             this.status = status;
@@ -652,7 +723,10 @@ impl Workspace {
 
     // ---- formatting ------------------------------------------------------
 
-    /// Pretty-print the active editor's SQL in place (Query / Scratch tabs).
+    /// Pretty-print the active editor's SQL in place (Query / Scratch tabs),
+    /// keeping the cursor (and a selection) by the text it was at, its line
+    /// where it was on screen — not back at the top, where replacing the whole
+    /// text would leave it.
     pub(super) fn format_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.active_tab() else { return };
         if matches!(tab.kind, TabKind::Table { .. }) {
@@ -666,7 +740,35 @@ impl Workspace {
             return;
         }
         let pretty = util::format_sql(&sql);
-        editor.update(cx, |state, cx| state.replace_all(pretty, window, cx));
+        if pretty == sql {
+            return;
+        }
+        editor.update(cx, |state, cx| {
+            let sel = state.selected_range();
+            let start = util::map_offset(&sql, &pretty, sel.start);
+            let end = if sel.is_empty() {
+                start
+            } else {
+                util::map_offset(&sql, &pretty, sel.end).max(start)
+            };
+            // How far down the viewport the cursor's line was (none before the
+            // first layout).
+            let line_h = state.line_height();
+            let was_y = line_h
+                .map(|h| h * display_row(state, state.cursor()) as f32 + state.scroll_offset().y);
+            state.replace_all(pretty, window, cx);
+            state.set_selected_range(start..end, cx);
+            // Put it back there. Not left to the selection's own scroll: that
+            // still clamps to the old text's height, stopping short in a long
+            // one. A set offset is clamped by the next layout, of the new text.
+            if let (Some(h), Some(was_y)) = (line_h, was_y) {
+                // On screen — at its edge if it had been scrolled away.
+                let room = (state.input_bounds().size.height - h).max(px(0.));
+                let y = was_y.clamp(px(0.), room);
+                let row = display_row(state, state.cursor());
+                state.set_scroll_offset(gpui::point(px(0.), y - h * row as f32), cx);
+            }
+        });
         cx.notify();
     }
 
@@ -857,6 +959,16 @@ impl Workspace {
     }
 }
 
+/// The display row (soft-wrapped lines counted apart) of byte `offset` in an
+/// editor.
+fn display_row(state: &EditorState, offset: usize) -> usize {
+    let at = state.text().offset_to_point(offset);
+    state
+        .display_map()
+        .buffer_pos_to_display_pos(gpui_component::input::BufferPoint::new(at.row, at.column))
+        .row
+}
+
 /// What a header sort writes into a Table tab's ORDER BY box: `"col" ASC|DESC`
 /// (empty for no sort, or a column that's gone).
 fn sort_clause(headers: &[String], sort: Option<(usize, bool)>) -> String {
@@ -939,6 +1051,138 @@ mod tests {
                 assert!(plan_shown(ws));
                 ws.explain_active(true, cx);
                 assert!(!plan_shown(ws));
+            })
+            .unwrap();
+    }
+
+    /// Run takes the selection when there is one — several statements and
+    /// all — else the statement under the cursor.
+    #[gpui::test]
+    fn run_takes_the_selection(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                let editor = ws.tab(id).unwrap().editor.clone();
+                let sql = "select 1;\nupdate t set a = 1;\nselect 2;";
+                editor.update(cx, |e, cx| {
+                    e.set_value(sql, window, cx);
+                    e.set_selected_range(10..sql.len(), cx);
+                });
+                ws.run_active_tab(cx);
+                let tab = ws.tab(id).unwrap();
+                let picked = "update t set a = 1;\nselect 2";
+                assert_eq!(tab.base_sql.as_deref(), Some(picked));
+                assert_eq!(tab.editor_run, Some((picked.into(), 10)));
+
+                // Nothing selected: the cursor's statement.
+                editor.update(cx, |e, cx| e.set_selected_range(3..3, cx));
+                ws.run_active_tab(cx);
+                assert_eq!(ws.tab(id).unwrap().base_sql.as_deref(), Some("select 1"));
+
+                // Explain the selection too.
+                editor.update(cx, |e, cx| e.set_selected_range(10..29, cx));
+                ws.explain_active(false, cx);
+                let tab = ws.tab(id).unwrap();
+                assert_eq!(tab.editor_run, Some(("update t set a = 1".into(), 10)));
+            })
+            .unwrap();
+    }
+
+    /// A selection of several statements runs without a describe after it:
+    /// its prepare would fail, and inside the transaction the run may have
+    /// left open (`begin; update …`) that failure would abort it.
+    #[gpui::test]
+    fn no_describe_for_several_statements(cx: &mut TestAppContext) {
+        let (window, mut unserved) = unserved_workspace(cx);
+        let run = |sql: &'static str, cx: &mut TestAppContext| {
+            window
+                .update(cx, |ws, window, cx| {
+                    ws.conn = Some(1);
+                    let id = match ws.active_id() {
+                        Some(id) => id,
+                        None => seed_query_tab(ws, window, cx),
+                    };
+                    let editor = ws.tab(id).unwrap().editor.clone();
+                    editor.update(cx, |e, cx| {
+                        e.set_value(sql, window, cx);
+                        e.set_selected_range(0..sql.len(), cx);
+                    });
+                    ws.run_active_tab(cx);
+                    ws.tab_mut(id).unwrap().running = false;
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        run("begin; update t set a = 1;", cx);
+        assert_eq!(unserved.pending_jobs(), 1, "the run alone");
+        unserved.fail_jobs(DbError::Query("unanswered".into()));
+        cx.run_until_parked();
+        run("select * from t;", cx);
+        assert_eq!(unserved.pending_jobs(), 2, "the run + its describe");
+    }
+
+    /// Statements that returned no rows get a message each, named by their
+    /// own text; ones with rows go to the grid instead.
+    #[test]
+    fn statements_without_rows_get_messages() {
+        let ms = std::time::Duration::from_millis;
+        let done = |columns, affected| Finished {
+            columns,
+            affected,
+            elapsed: ms(2),
+        };
+        let sql = "begin;\nupdate t set a = 1;\n-- note\nselect * from t;\ncreate table u as select 1;\ndrop table u";
+        let out = run_messages(
+            sql,
+            &[
+                done(false, 0),
+                done(false, 3),
+                done(true, 3),
+                done(false, 1),
+                done(false, 0),
+            ],
+        );
+        let said: Vec<(String, String)> =
+            out.iter().map(|m| (m.tag.clone(), m.outcome())).collect();
+        let pair = |t: &str, o: &str| (t.to_string(), o.to_string());
+        assert_eq!(
+            said,
+            vec![
+                pair("BEGIN", "done"),
+                pair("UPDATE", "3 rows affected"),
+                pair("CREATE TABLE", "1 row affected"),
+                pair("DROP TABLE", "done"),
+            ]
+        );
+        // An UPDATE that matched nothing still says so.
+        let out = run_messages("update t set a = 1 where false", &[done(false, 0)]);
+        assert_eq!(out[0].outcome(), "0 rows affected");
+        // The server ran a different number of statements than the split
+        // found: no names to trust.
+        let out = run_messages("select 1", &[done(false, 0), done(false, 0)]);
+        assert!(out.iter().all(|m| m.tag == "Statement"));
+    }
+
+    /// Format leaves the cursor by the token it was at, not at the top.
+    #[gpui::test]
+    fn format_keeps_the_cursor(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                let editor = ws.tab(id).unwrap().editor.clone();
+                let sql = "select a from t;\n\nupdate t set a = 2 where id = 3;";
+                let at = sql.find("where").unwrap() + 2;
+                editor.update(cx, |e, cx| {
+                    e.set_value(sql, window, cx);
+                    e.set_selected_range(at..at, cx);
+                });
+                ws.format_active(window, cx);
+                let ed = editor.read(cx);
+                let text = ed.value().to_string();
+                assert_ne!(text, sql);
+                assert_eq!(ed.cursor(), text.find("WHERE").unwrap() + 2, "{text}");
             })
             .unwrap();
     }
