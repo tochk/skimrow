@@ -255,7 +255,7 @@ pub(super) const SHORTCUTS: &[ShortcutSection] = &[
     (
         "QUERY",
         &[
-            ("Run statement under cursor", "Ctrl+Enter"),
+            ("Run selection, or statement under cursor", "Ctrl+Enter"),
             ("Accept completion", "Enter / Tab"),
             ("Apply staged changes", "Ctrl+S"),
         ],
@@ -513,11 +513,27 @@ impl Workspace {
     /// Give the grid focus on the next render — for the paths that end a cell
     /// edit without a `&mut Window` at hand (the input's own events). The input
     /// unmounts with the edit, and focus would otherwise fall off the grid.
+    ///
+    /// Also: a Query / Scratch tab's grid isn't drawn once a run returned no
+    /// rows — focus left on it would reach nothing (no key would work), so it
+    /// goes to the editor.
     pub(super) fn flush_pending_focus(&mut self, window: &mut Window, cx: &mut App) {
-        if !std::mem::take(&mut self.pending_grid_focus) {
+        let pending = std::mem::take(&mut self.pending_grid_focus);
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if !tab.shows_grid() {
+            let lost = !matches!(tab.kind, TabKind::Table { .. })
+                && tab.grid_focus.is_focused(window)
+                // Focusing an input needs the window's `Root` (absent in
+                // headless tests).
+                && window.root::<gpui_component::Root>().flatten().is_some();
+            if lost {
+                tab.editor.read(cx).focus_handle(cx).focus(window, cx);
+            }
             return;
         }
-        if let Some(tab) = self.active_tab().filter(|t| t.plan.is_none()) {
+        if pending {
             tab.grid_focus.focus(window, cx);
         }
     }

@@ -270,6 +270,183 @@ pub(crate) fn statement_range(sql: &str, cursor: usize) -> std::ops::Range<usize
     }
 }
 
+/// What Run (and Explain) take from an editor: the selection when one holds
+/// any SQL (trimmed, a final `;` too, as `statement_range` leaves it out — it
+/// may span several statements, which run as one submission), else the
+/// statement under the cursor.
+pub(crate) fn run_range(
+    sql: &str,
+    selected: std::ops::Range<usize>,
+    cursor: usize,
+) -> std::ops::Range<usize> {
+    if let Some(part) = sql.get(selected.clone()) {
+        let start = selected.start + (part.len() - part.trim_start().len());
+        let len = part
+            .trim()
+            .trim_end_matches(|c: char| c == ';' || c.is_whitespace())
+            .len();
+        if len > 0 {
+            return start..start + len;
+        }
+    }
+    statement_range(sql, cursor)
+}
+
+/// `stmt` from its first token on: leading whitespace and comments dropped
+/// (empty for a blank / comment-only statement, which the server skips).
+fn skip_comments(stmt: &str) -> &str {
+    let mut rest = stmt;
+    loop {
+        rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix("--") {
+            rest = r.find('\n').map_or("", |i| &r[i..]);
+        } else if let Some(r) = rest.strip_prefix("/*") {
+            rest = r.find("*/").map_or("", |i| &r[i + 2..]);
+        } else {
+            return rest;
+        }
+    }
+}
+
+/// The statements of a submission as the server runs them, in order:
+/// `statement_spans` minus the blank / comment-only ones (it skips those, so
+/// they get no result of their own).
+pub(crate) fn statements(sql: &str) -> Vec<&str> {
+    statement_spans(sql)
+        .into_iter()
+        .map(|(s, e)| &sql[s..e])
+        .filter(|stmt| !skip_comments(stmt).is_empty())
+        .collect()
+}
+
+/// What a statement is, for its line under the editor: its leading keyword
+/// (`UPDATE`), and for a schema change the kind of object too (`CREATE
+/// TABLE`, `DROP INDEX`) — roughly Postgres' command tag, which the driver
+/// doesn't pass on. Empty when it starts with no keyword.
+pub(crate) fn command_tag(stmt: &str) -> String {
+    let mut words = Vec::new();
+    let mut rest = skip_comments(stmt);
+    while words.len() < 8 {
+        rest = skip_comments(rest);
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphabetic() || c == '_'))
+            .unwrap_or(rest.len());
+        if end == 0 {
+            break;
+        }
+        words.push(rest[..end].to_ascii_uppercase());
+        rest = &rest[end..];
+    }
+    let mut words = words.into_iter();
+    let Some(mut tag) = words.next() else {
+        return String::new();
+    };
+    if matches!(tag.as_str(), "CREATE" | "ALTER" | "DROP") {
+        const MODIFIERS: &[&str] = &[
+            "OR",
+            "REPLACE",
+            "UNIQUE",
+            "TEMP",
+            "TEMPORARY",
+            "UNLOGGED",
+            "GLOBAL",
+            "LOCAL",
+            "TRUSTED",
+            "PROCEDURAL",
+            "RECURSIVE",
+        ];
+        let mut words = words.skip_while(|w| MODIFIERS.contains(&w.as_str()));
+        if let Some(object) = words.next() {
+            let second: &[&str] = match object.as_str() {
+                "MATERIALIZED" => &["VIEW"],
+                "FOREIGN" => &["TABLE", "DATA"],
+                "EVENT" => &["TRIGGER"],
+                "TEXT" => &["SEARCH"],
+                "ACCESS" => &["METHOD"],
+                "USER" => &["MAPPING"],
+                "OPERATOR" => &["CLASS", "FAMILY"],
+                _ => &[],
+            };
+            tag = format!("{tag} {object}");
+            if let Some(next) = words.next().filter(|w| second.contains(&w.as_str())) {
+                tag = format!("{tag} {next}");
+            }
+        }
+    }
+    tag
+}
+
+/// Whether a statement tagged `tag` (`command_tag`) reports how many rows
+/// it changed — the ones Postgres gives a row count in their command tag.
+pub(crate) fn counts_rows(tag: &str) -> bool {
+    matches!(
+        tag.split(' ').next().unwrap_or(""),
+        "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "COPY" | "SELECT" | "WITH" | "FETCH" | "MOVE"
+    )
+}
+
+/// A statement's run time for its message: `12 ms`, `3.40 s`.
+pub(crate) fn took(d: std::time::Duration) -> String {
+    match d.as_millis() {
+        0 => "<1 ms".into(),
+        ms if ms < 1000 => format!("{ms} ms"),
+        _ => format!("{:.2} s", d.as_secs_f64()),
+    }
+}
+
+/// Where byte offset `at` of `old` lands in `new`, a reformatting of it (the
+/// same tokens, other whitespace and keyword case — `format_sql`): right after
+/// the same character it followed, or — when it stood before a token or in
+/// whitespace — right before that token. The two texts are lined up by their
+/// non-whitespace characters, skipping a few that one side dropped (an empty
+/// statement's `;`) so the rest still lines up.
+pub(crate) fn map_offset(old: &str, new: &str, at: usize) -> usize {
+    let solid = |s: &str| -> Vec<(usize, char)> {
+        s.char_indices()
+            .filter(|(_, ch)| !ch.is_whitespace())
+            .collect()
+    };
+    let (o, n) = (solid(old), solid(new));
+    let same = |a: char, b: char| a.eq_ignore_ascii_case(&b);
+    // `to[i]`: the character of `new` that `old`'s i-th one became.
+    let mut to = vec![None; o.len()];
+    let (mut i, mut j) = (0, 0);
+    while i < o.len() && j < n.len() {
+        if same(o[i].1, n[j].1) {
+            to[i] = Some(j);
+            i += 1;
+            j += 1;
+        } else if let Some(k) = (1..=4).find(|&k| o.get(i + k).is_some_and(|c| same(c.1, n[j].1))) {
+            i += k;
+        } else if let Some(k) = (1..=4).find(|&k| n.get(j + k).is_some_and(|c| same(o[i].1, c.1))) {
+            j += k;
+        } else {
+            to[i] = Some(j);
+            i += 1;
+            j += 1;
+        }
+    }
+    let at = at.min(old.len());
+    // How many of `old`'s characters come before `at`.
+    let before = o.partition_point(|&(b, _)| b < at);
+    let after_token = old[..at]
+        .chars()
+        .next_back()
+        .is_some_and(|c| !c.is_whitespace());
+    if after_token {
+        // Right after the last character before it that has a counterpart.
+        (0..before)
+            .rev()
+            .find_map(|k| to[k])
+            .map_or(0, |j| n[j].0 + n[j].1.len_utf8())
+    } else {
+        // Right before the next one that has.
+        (before..o.len())
+            .find_map(|k| to[k])
+            .map_or(new.len(), |j| n[j].0)
+    }
+}
+
 /// The byte span of `sql` to underline for a server error at 1-based
 /// character `pos` (Postgres' error position): the token that starts there —
 /// a word, a quoted name / string, or one symbol. An error at the very end
@@ -454,6 +631,114 @@ mod error_span_tests {
         // Positions count characters, not bytes.
         let sql = "SELECT 'ä' + nope";
         assert_eq!(&sql[error_span(sql, 14)], "nope");
+    }
+}
+
+#[cfg(test)]
+mod run_text_tests {
+    use super::*;
+
+    /// A selection runs as it is (trimmed, several statements and all); an
+    /// empty or blank one falls back to the statement under the cursor.
+    #[test]
+    fn run_range_prefers_the_selection() {
+        let sql = "select 1;\nupdate t set a = 1;\nselect 2;";
+        let whole = 0..sql.len();
+        assert_eq!(
+            &sql[run_range(sql, whole.clone(), 3)],
+            "select 1;\nupdate t set a = 1;\nselect 2"
+        );
+        let r = run_range(sql, 7..9, 0);
+        assert_eq!(&sql[r], "1");
+        // Whitespace around the selection is dropped, not run.
+        let r = run_range(sql, 9..29, 0);
+        assert_eq!(r.start, 10);
+        assert_eq!(&sql[r], "update t set a = 1");
+        // Nothing (or only whitespace) selected: the cursor's statement.
+        assert_eq!(&sql[run_range(sql, 12..12, 12)], "update t set a = 1");
+        assert_eq!(&sql[run_range(sql, 9..10, 25)], "update t set a = 1");
+        assert_eq!(&sql[run_range(sql, 8..9, 25)], "update t set a = 1");
+    }
+
+    #[test]
+    fn statements_skip_blank_and_comment_only_ones() {
+        let sql = "-- head\nselect 1; ;\n/* c */ ;update t set a = ';';\n-- tail";
+        assert_eq!(
+            statements(sql),
+            vec!["-- head\nselect 1", "update t set a = ';'"]
+        );
+    }
+
+    #[test]
+    fn command_tags_name_the_statement() {
+        assert_eq!(command_tag("  update t set a = 1"), "UPDATE");
+        assert_eq!(
+            command_tag("-- why\n/* x */ insert into t values (1)"),
+            "INSERT"
+        );
+        assert_eq!(command_tag("create table t (a int)"), "CREATE TABLE");
+        assert_eq!(
+            command_tag("CREATE OR REPLACE FUNCTION f() …"),
+            "CREATE FUNCTION"
+        );
+        assert_eq!(
+            command_tag("create unique index i on t (a)"),
+            "CREATE INDEX"
+        );
+        assert_eq!(command_tag("drop table if exists t"), "DROP TABLE");
+        assert_eq!(
+            command_tag("create materialized view v as select 1"),
+            "CREATE MATERIALIZED VIEW"
+        );
+        assert_eq!(
+            command_tag("create user mapping for x"),
+            "CREATE USER MAPPING"
+        );
+        assert_eq!(command_tag("create user bob"), "CREATE USER");
+        assert_eq!(command_tag("begin"), "BEGIN");
+        assert_eq!(command_tag("(select 1)"), "");
+        assert!(counts_rows("UPDATE") && counts_rows("DELETE") && counts_rows("WITH"));
+        assert!(!counts_rows("CREATE TABLE") && !counts_rows("BEGIN"));
+    }
+
+    #[test]
+    fn took_reads_like_a_duration() {
+        use std::time::Duration;
+        assert_eq!(took(Duration::from_micros(300)), "<1 ms");
+        assert_eq!(took(Duration::from_millis(42)), "42 ms");
+        assert_eq!(took(Duration::from_millis(3400)), "3.40 s");
+    }
+
+    /// Format keeps the cursor by the same token, wherever the formatter moved it.
+    #[test]
+    fn format_keeps_the_cursor_on_its_token() {
+        let old = "select a, b from t where x = 1;\n\nupdate t set a = 2 where id = 3;\n";
+        let new = format_sql(old);
+        let at = |s: &str, pat: &str| s.find(pat).unwrap();
+        // Inside a word: the same spot in it.
+        let o = at(old, "where x") + 3;
+        let n = map_offset(old, &new, o);
+        assert_eq!(n, at(&new, "WHERE") + 3, "{new}");
+        // Before a token (in the whitespace before it): before that token.
+        let o = at(old, "update") - 1;
+        assert!(new[map_offset(old, &new, o)..].starts_with("UPDATE"));
+        // After a token: right after it.
+        let o = at(old, "id = 3") + 2;
+        assert!(new[..map_offset(old, &new, o)].ends_with("id"));
+        // The ends stay the ends.
+        assert_eq!(map_offset(old, &new, 0), 0);
+        assert_eq!(map_offset(old, &new, old.len()), new.len());
+    }
+
+    /// A character one side dropped (an empty statement's `;`) doesn't throw
+    /// off where everything after it lands.
+    #[test]
+    fn map_offset_survives_dropped_characters() {
+        let old = "select 1;;\nselect 22";
+        let new = "SELECT\n  1;\n\nSELECT\n  22";
+        let o = old.rfind("22").unwrap() + 1;
+        let n = map_offset(old, new, o);
+        assert_eq!(&new[n - 1..=n], "22");
     }
 }
 

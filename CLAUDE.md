@@ -371,7 +371,9 @@ The WSL host can run Windows exes directly:
   `scale_factor`). Now `view.rs::editor_split` builds the split from flex WEIGHTS
   (`weighted`/`fill`: grow = share, basis 0, min 0) — no percentages — with our own drag
   handle (`EditorSplitDrag`, `Tab.editor_split`, default `grid::EDITOR_SPLIT` = half;
-  `tabs::editor_split_at` clamps panes to 60px; double-click = half again).
+  `tabs::editor_split_at` clamps panes to 60px; double-click = half again). The results pane
+  is there only while `Tab::has_output` (rows, plan, error, messages or a run's loader);
+  otherwise the editor fills the tab (the user's ask) — see "Query / Scratch results".
   `view.rs::layout_tests` sweeps window heights (×1.37px steps, bottom panel on/off) and
   checks every box; the test platform's scale is 2.0, and the sweep DOES reproduce the old
   collapse (verified by swapping the old `v_resizable` code back in). Elements that can't take a `debug_selector` (the `Editor`) are measured with `input_bounds()` of its state.
@@ -1077,12 +1079,36 @@ The WSL host can run Windows exes directly:
   same scanner `statement_range` uses) and re-joins them keeping the original count of blank
   lines between statements, minimum one (the user's ask) — `sqlformat` on the whole text
   puts statements on consecutive lines. A `--` comment on the line a statement ends on is
-  kept on that line. Run / Ctrl+Enter runs the **statement under the cursor**, not the whole
-  editor: `util::statement_range(sql, cursor_byte_offset)` splits on top-level `;` honoring
-  `'`/`"` quotes, `--`/`/* */` comments, and `$tag$` dollar-quoting (`EditorState::cursor()`
-  gives the byte offset). **Syntax highlight is a feature flag**: gpui-component's `tree-sitter-sql` feature
+  kept on that line. **Format keeps the cursor** (the user's ask): `util::map_offset` lines up
+  old/new text by their non-whitespace chars (case-insensitive, skipping a few one side
+  dropped, e.g. an empty statement's `;`) → `set_selected_range` after `replace_all` (which
+  resets to the top). Its line is put back at the same SCREEN row via `set_scroll_offset`:
+  the selection's own `scroll_to` clamps against the OLD text's `scroll_size` and stops short
+  in a long script, while a set offset is clamped by the next layout of the new text.
+  Run / Ctrl+Enter (and Explain) run the **selection** if it holds any SQL (trimmed + final
+  `;` dropped, may be several statements — one simple-query submission), else the
+  **statement under the cursor**: `util::run_range` → `util::statement_range(sql,
+  cursor_byte_offset)`, which splits on top-level `;` honoring
+  `'`/`"` quotes, `--`/`/* */` comments, and `$tag$` dollar-quoting (`EditorState::cursor()` /
+  `selected_range()` give byte offsets). A multi-statement run is NOT `describe`d
+  (`describe_async` skips unless `util::statements` = 1): the prepare always fails on several
+  statements, and inside a transaction the run left open (`begin; update …`) that error would
+  ABORT it. **Syntax highlight is a feature flag**: gpui-component's `tree-sitter-sql` feature
   (Cargo.toml) provides the grammar for `EditorState::language("sql")`. Don't enable the
   all-or-nothing `tree-sitter-languages` one.
+
+- **Query / Scratch results** (the user's asks): no empty table. `Tab::shows_grid` = a Table
+  tab, or a result WITH columns; a run whose statements returned none shows MESSAGES instead
+  (`Tab.messages: Vec<grid::RunMessage>`, `view.rs::render_messages`): one line per such
+  statement — `UPDATE  3 rows affected  4 ms`, `CREATE TABLE  done`. The driver gives only the
+  row count (`CommandComplete(u64)`), so the name comes from the statement's text
+  (`util::command_tag`; `util::statements` = `statement_spans` minus blank / comment-only ones,
+  matched 1:1 with the `Done` events — counts differ → "Statement"). `drain_query` keeps the
+  LAST result set (a `Columns` event clears earlier rows; it used to append them under the
+  last headers) and a `Finished` per statement; above a grid the messages keep to a few
+  scrolling lines. Cleared by the next result / error (not at run start) or their ×. A grid
+  that stops being drawn while focused hands focus to the editor (`flush_pending_focus`),
+  else no key would reach anything.
 
 - **Schema-aware completion = the bundled `sqls` LSP server, driven in-process** (`src/lsp.rs`).
   NOT a homegrown completer and NOT a hand-rolled protocol server — it's a real LSP client to
