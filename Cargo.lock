@@ -7143,6 +7143,7 @@ dependencies = [
  "embed-resource",
  "flume",
  "futures-channel",
+ "gpui-base",
  "gpui-component",
  "gpui-pre",
  "gpui-pre-platform",

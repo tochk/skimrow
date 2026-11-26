@@ -78,8 +78,7 @@ fn main() {
         // wheel; without a bar there's nothing to discover or drag). `Always` is
         // the data-grid convention. `Theme::change` (the settings modal's live
         // light/dark switch) only touches colors, so this survives a theme swap.
-        gpui_component::Theme::global_mut(cx).scrollbar_mode =
-            gpui_component::scroll::ScrollbarMode::Always;
+        workspace::colors::show_scrollbars_always(cx);
 
         cx.bind_keys([
             KeyBinding::new("ctrl-enter", RunQuery, None),
