@@ -33,6 +33,9 @@ embed-resource = "3.0.12"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+# Scrollbars read their mode from gpui-base's theme projection; a test checks it.
+# Same version gpui-component pins.
+gpui-base = "=0.8.1"
 # Enables `secret::probe` so the connect regression test can assert the keychain
 # read is deferred off the UI thread. Dev-only: absent from the release binary.
 skimrow-config = { path = "../skimrow-config", features = ["test-probe"] }

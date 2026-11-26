@@ -51,6 +51,16 @@ pub(crate) fn change_theme(mode: ThemeMode, cx: &mut App) {
     });
 }
 
+/// Keep every scrollbar visible (`ScrollbarMode::Always`).
+///
+/// Must go through `Theme::set_scrollbar_mode`: scrollbars read the mode from
+/// gpui-base's own projection of the theme, which only `Theme::update` rebuilds.
+/// Writing `Theme::global_mut(cx).scrollbar_mode` changed nothing on screen —
+/// the grid's horizontal bar kept fading out 2s after a scroll.
+pub(crate) fn show_scrollbars_always(cx: &mut App) {
+    Theme::set_scrollbar_mode(gpui_component::scroll::ScrollbarMode::Always, cx);
+}
+
 pub(crate) fn palette(cx: &App) -> Colors {
     let t = cx.theme();
     Colors {
@@ -87,5 +97,20 @@ mod tests {
         let dark = cx.read(palette);
         assert_ne!(light.center, dark.center);
         assert_ne!(light.fg, dark.fg);
+    }
+
+    #[gpui::test]
+    fn scrollbars_stay_visible_across_theme_switch(cx: &mut TestAppContext) {
+        use gpui_component::scroll::ScrollbarMode;
+        let mode =
+            |cx: &mut TestAppContext| cx.read(|cx| gpui_base::Theme::global(cx).scrollbar.mode());
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            change_theme(ThemeMode::Light, cx);
+            show_scrollbars_always(cx);
+        });
+        assert_eq!(mode(cx), ScrollbarMode::Always);
+        cx.update(|cx| change_theme(ThemeMode::Dark, cx));
+        assert_eq!(mode(cx), ScrollbarMode::Always);
     }
 }
