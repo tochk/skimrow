@@ -25,6 +25,10 @@ crates/
                (Settings, default 30s → `DbError::Timeout`). See "Slow networks".
   skimrow-config/  JSON settings (connections, theme, keymap) + OS-keychain passwords
                (secret.rs, keyring; per-OS backend).
+  skimrow-update/  self-update, no gpui: GitHub latest-release lookup (ureq, rustls/ring,
+               OS roots via rustls-native-certs), download + sha256 check, unpack,
+               swap-in install, leftover cleanup. Blocking; the app runs it off the
+               UI thread. See "Updates" below.
   skimrow-app/     gpui app (bin `skimrow`): workspace/ (the UI — ONE `Workspace` gpui
                entity, split by concern into child modules; each file holds an
                `impl Workspace` block + its own tests):
@@ -45,6 +49,8 @@ crates/
                  modal.rs   dialogs: one-at-a-time `Modal` state, focus trap,
                             the shared occluding backdrop (`modal_layer`)
                  export.rs  CSV/JSON/INSERTs/TSV export
+                 update.rs  updater state machine: auto/manual check, background
+                            download, "Restart to update", install on quit
                  view.rs    all render_* + impl Render
                  grid.rs    Tab/TabKind + ResultDelegate
                  colors.rs / util.rs   palette / pure SQL+config helpers
@@ -197,6 +203,42 @@ The WSL host can run Windows exes directly:
 - **NEVER add a `Co-Authored-By:` trailer** (no Claude co-author line, ever).
 
 ## Gotchas
+
+- **Updates** (`crates/skimrow-update`, `workspace/update.rs`), Zed-style: a check 10s after
+  start then hourly (`Settings.auto_update`, default on) asks
+  `api.github.com/repos/tochk/skimrow/releases/latest` (stable only; unauthenticated, 60/h/IP;
+  `User-Agent: skimrow/<version>`, nothing else), downloads this target's asset
+  (`skimrow_update::asset_name` — the release.yml zip names; renaming one breaks updating for
+  every existing install) into `<cache_dir>/update/<version>/`, checks size + the asset's
+  `digest` sha256, unpacks ONLY the expected top-level names (`skimrow[.exe]`, `sqls[.exe]`;
+  macOS `skimrow.app.zip` → `ditto -x -k`), then the title bar shows ONE button, **Restart to
+  update** (`UpdateState::Ready`). Click → `ConfirmRestart` only if work would be lost
+  (`unsaved_work`: staged edits, open transaction, running query, cell being edited) → the
+  close-path flushes → `skimrow_update::install` on `background_spawn` → `cx.set_restart_path`
+  + `cx.restart()` (gpui's own: waits for our pid, relaunches; bash / `open` / PowerShell).
+  **Quitting installs a Ready update too** (the user's call, as Zed): `install_on_quit` from
+  `on_window_should_close`, the Linux title-bar ×, and `cx.on_app_quit`. Settings → ABOUT has
+  the status line + Check for updates; palette has "Check for updates" / "Restart to update".
+  - **Dev builds never replace themselves** (`build_info::self_update_allowed`: release profile,
+    not dirty, not a `git describe` version — semver would read `0.9.0-3-gabc` as OLDER than
+    0.9.0, so `skimrow_update::base_version` compares from the described tag). There and when
+    the install isn't writable (Program Files, /usr/bin, a root-owned .app) or the release has
+    no asset for this target, the state is `Manual` → a ghost "X available" button opens the
+    release page. `SKIMROW_UPDATE_URL` (a JSON shaped like GitHub's answer) overrides the
+    endpoint AND lifts the dev gate — for testing only.
+  - **The install path is captured at startup** (`init_updates` in `main`, an `OnceLock`): on
+    Linux `current_exe()` reads `/proc/self/exe`, which says `… (deleted)` once the binary is
+    replaced, so neither it nor gpui's default restart path work afterwards. Tests never call
+    `init_updates`, so no test can install anything.
+  - Swap = copy each staged file to `<target>.new` in the install dir (same filesystem), then
+    `<target>` → `<target>.old` (Windows allows renaming a running exe, not deleting it),
+    `.new` → `<target>`, renames retried (Defender locks fresh exes), rolled back on failure.
+    `.old` is deleted at once where the OS lets us; `cleanup` at the next start gets the rest,
+    and `prune` drops staged versions that aren't newer than the running one.
+  - Verify end to end with a release-like build copied out of `target/` (the swap replaces the
+    binary it runs!) + `python3 -m http.server` serving `latest.json` (`tag_name`, `html_url`,
+    `assets[{name, browser_download_url, size}]`) and the zip, `SKIMROW_UPDATE_URL` pointing at
+    it, isolated `XDG_CONFIG_HOME` / `XDG_CACHE_HOME`.
 
 - **The app was called `zdb` until v0.8.0** (renamed to skimrow; the repo checkout dir and
   the local Postgres role / `/mnt/c/zdbtest` kept the old name). Existing installs are carried

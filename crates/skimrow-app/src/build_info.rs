@@ -14,7 +14,15 @@ pub const TARGET: &str = env!("SKIMROW_BUILD_TARGET");
 /// `release` / `debug`.
 pub const PROFILE: &str = env!("SKIMROW_BUILD_PROFILE");
 pub const RUSTC: &str = env!("SKIMROW_BUILD_RUSTC");
-const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+
+/// This build may replace itself with a newer release: a release build of a
+/// released version (not a `git describe` dev version, not dirty) — or any
+/// build while `SKIMROW_UPDATE_URL` points the updater at a test server.
+pub fn self_update_allowed() -> bool {
+    skimrow_update::url_override().is_some()
+        || (PROFILE == "release" && !DIRTY && !skimrow_update::is_dev_version(VERSION))
+}
 
 /// `abc1234`, `abc1234 (dirty)`, or `unknown`.
 pub fn commit_label() -> String {

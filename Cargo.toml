@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/skimrow-app", "crates/skimrow-db", "crates/skimrow-config"]
+members = [
+    "crates/skimrow-app",
+    "crates/skimrow-db",
+    "crates/skimrow-config",
+    "crates/skimrow-update",
+]
 
 [workspace.package]
 version = "0.9.0"
@@ -34,6 +39,14 @@ futures-util = "0.3.34"
 # SSH tunnels (`skimrow-db/src/ssh.rs`). `ring`, like rustls, not the default aws-lc
 # (needs cmake + nasm to build on Windows).
 russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
+
+# Self-update (`skimrow-update`). ureq's `rustls` feature is rustls on `ring`
+# (like the rest of the tree, not aws-lc); the OS trust store is loaded with
+# rustls-native-certs (corporate CAs). zip: read deflate entries only.
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+zip = { version = "9.8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+semver = "1.0"
+sha2 = "0.10"
 
 # Shared
 anyhow = "1.0.104"

@@ -28,6 +28,13 @@ pub fn config_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", APP_NAME).map(|d| d.config_dir().to_path_buf())
 }
 
+/// The OS cache directory of the app (`~/.cache/skimrow`,
+/// `%LOCALAPPDATA%\skimrow\cache`, `~/Library/Caches/skimrow`): downloaded
+/// updates.
+pub fn cache_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", APP_NAME).map(|d| d.cache_dir().to_path_buf())
+}
+
 /// Move the pre-rename config directory (settings, saved tabs, scratch, trusted
 /// host keys) to the new one, once: only while the new one doesn't exist yet.
 /// Called at startup by the app ONLY — never from the path helpers, which tests
@@ -107,6 +114,9 @@ pub struct Settings {
     /// pastes. Off: both go to the shell as they are (interrupt; the shell's own
     /// Ctrl+V, e.g. PowerShell's paste).
     pub terminal_ctrl_clipboard: bool,
+    /// Look for a new release at startup and hourly, download it in the
+    /// background and offer "Restart to update" (release builds only).
+    pub auto_update: bool,
 }
 
 /// `Settings::pool_size` range the UI allows.
@@ -134,6 +144,7 @@ impl Default for Settings {
             confirm_apply: true,
             terminal_shell: String::new(),
             terminal_ctrl_clipboard: true,
+            auto_update: true,
         }
     }
 }
@@ -472,6 +483,7 @@ mod tests {
             confirm_apply: false,
             terminal_shell: r#""C:\Program Files\Git\bin\bash.exe" -l"#.into(),
             terminal_ctrl_clipboard: false,
+            auto_update: false,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         assert!(json.contains(r#""export_format": "inserts""#));
@@ -484,6 +496,7 @@ mod tests {
         assert!(back.esc_saves_edit && back.vim_navigation);
         assert!(!back.restore_tabs);
         assert!(!back.terminal_ctrl_clipboard);
+        assert!(!back.auto_update);
         assert_eq!(back.pool_size, 7);
         assert_eq!(back.connect_timeout_secs, 0);
         assert_eq!(back.connections[0].id, "abc");
@@ -541,6 +554,8 @@ mod tests {
         assert!(s.confirm_apply);
         // The terminal runs the platform's default shell.
         assert!(s.terminal_shell.is_empty());
+        // Updates are looked for unless turned off.
+        assert!(s.auto_update);
     }
 
     #[test]

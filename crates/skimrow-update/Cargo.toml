@@ -1,0 +1,19 @@
+[package]
+name = "skimrow-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+rustls-native-certs.workspace = true
+zip.workspace = true
+semver.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
