@@ -19,6 +19,7 @@ flume.workspace = true
 portable-pty.workspace = true
 skimrow-db = { path = "../skimrow-db" }
 skimrow-config = { path = "../skimrow-config" }
+skimrow-update = { path = "../skimrow-update" }
 anyhow.workspace = true
 sqlformat.workspace = true
 # lsp-types 0.97.0 (stable) matches gpui-component's, so our CompletionProvider

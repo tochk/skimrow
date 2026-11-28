@@ -2397,6 +2397,13 @@ impl Workspace {
                 ))
             })
             .child(setting_row(
+                "Check for updates automatically",
+                Checkbox::new("auto-update")
+                    .checked(self.settings.auto_update)
+                    .on_click(cx.listener(|this, on: &bool, _, cx| this.set_auto_update(*on, cx)))
+                    .into_any_element(),
+            ))
+            .child(setting_row(
                 "Keyboard shortcuts",
                 Button::new("show-shortcuts")
                     .label("Show (F1)")
@@ -2414,6 +2421,7 @@ impl Workspace {
             )
             .child(section_header("ABOUT", c))
             .child(self.render_about(c, cx))
+            .child(self.render_update_row(c, cx))
             .child(
                 h_flex().p_2().gap_2().justify_end().child(
                     Button::new("close-settings").label("Close").on_click(
@@ -2475,6 +2483,127 @@ impl Workspace {
                             })),
                     ),
             )
+    }
+
+    /// Settings → ABOUT's update line: what the updater knows, and the one
+    /// button that fits (check / restart to update / download by hand).
+    fn render_update_row(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = &self.update;
+        let text_color = match state {
+            UpdateState::Failed { .. } => c.danger,
+            _ => c.fg,
+        };
+        let action = match state {
+            UpdateState::Ready { .. } => Button::new("update-row-restart")
+                .label("Restart to update")
+                .primary()
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.request_update_restart(window, cx)
+                })),
+            UpdateState::Manual { release, .. } => Button::new("update-row-download")
+                .label(format!("Download {}", release.version))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_release_page(cx))),
+            _ => Button::new("update-row-check")
+                .label("Check for updates")
+                .disabled(state.busy())
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.check_for_updates(true, cx)),
+                ),
+        };
+        let notes = state.release().filter(|r| !r.page.is_empty()).map(|_| {
+            div()
+                .id("update-notes")
+                .text_xs()
+                .text_color(cx.theme().blue)
+                .cursor_pointer()
+                .hover(|s| s.underline())
+                .child("Release notes")
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_release_page(cx)))
+        });
+        h_flex()
+            .px_3()
+            .py_2()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(c.border)
+            .child(
+                div()
+                    .w(px(80.))
+                    .flex_none()
+                    .text_xs()
+                    .text_color(c.fg_dim)
+                    .child("Updates"),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .gap_2()
+                    .items_center()
+                    .when(state.busy(), |d| {
+                        d.child(spinner().color(c.fg_dim).xsmall())
+                    })
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .text_xs()
+                            .text_color(text_color)
+                            .child(state.describe()),
+                    )
+                    .children(notes),
+            )
+            .child(action)
+    }
+
+    /// "Restart to update?" — restarting now would throw work away.
+    fn render_confirm_restart(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let c = palette(cx);
+        let version = self
+            .update
+            .release()
+            .map(|r| r.version.to_string())
+            .unwrap_or_default();
+        let lost = self.unsaved_work();
+        let body =
+            v_flex()
+                .p_4()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(c.fg)
+                        .child(format!("Restart to update to skimrow {version}?")),
+                )
+                .child(
+                    v_flex().gap_1().children(
+                        lost.into_iter()
+                            .map(|line| div().text_xs().text_color(c.fg).child(line)),
+                    ),
+                )
+                .child(div().text_xs().text_color(c.fg_dim).child(
+                    "Restarting discards staged changes and rolls back open transactions. \
+                 Otherwise the update installs when you quit.",
+                ))
+                .child(
+                    h_flex()
+                        .pt_1()
+                        .gap_2()
+                        .justify_end()
+                        .child(Button::new("restart-later").label("Not now").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.close_modal(cx)),
+                        ))
+                        .child(
+                            Button::new("restart-now")
+                                .label("Restart")
+                                .danger()
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.install_and_restart(window, cx)
+                                })),
+                        ),
+                );
+        self.modal_layer(v_flex().mt(px(120.)).w(px(460.)).child(body), cx)
     }
 
     /// The terminal's shell: typed (a command line), picked from the shells
@@ -2852,6 +2981,8 @@ impl Workspace {
         // does NOT work: the results table's min-content width inflates the layout
         // width past the window, pushing the controls off-screen right. A definite
         // width pins the right edge.
+        // The update button sits OUTSIDE the drag region too (a press there
+        // would move the window instead of clicking it).
         let mut bar = h_flex()
             .w(window.viewport_size().width)
             .h(modal::TITLEBAR_H)
@@ -2860,7 +2991,8 @@ impl Workspace {
             .bg(c.header)
             .border_b_1()
             .border_color(c.border)
-            .child(drag);
+            .child(drag)
+            .children(self.render_update_button(c, cx));
         // macOS keeps its native traffic lights; drawing our own controls would
         // duplicate them (and ours would overlap the top-right corner).
         if !cfg!(target_os = "macos") {
@@ -2868,6 +3000,62 @@ impl Workspace {
         }
 
         bar
+    }
+
+    /// The title bar's update button (Zed's "Restart to update"): there only
+    /// once there is something to click — a downloaded update, or a newer
+    /// release this copy can't install itself (opens its page).
+    fn render_update_button(&self, c: Colors, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let inner = match &self.update {
+            UpdateState::Ready { release, .. } => Button::new("update-restart")
+                .small()
+                .tab_stop(false)
+                .primary()
+                .icon(Icon::empty().path("icons/download.svg"))
+                .label("Restart to update")
+                .tooltip(format!(
+                    "skimrow {} is downloaded: restart to install it",
+                    release.version
+                ))
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.request_update_restart(window, cx)
+                }))
+                .into_any_element(),
+            UpdateState::Installing { .. } => h_flex()
+                .gap_1()
+                .items_center()
+                .child(spinner().color(c.fg_dim).xsmall())
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(c.fg_dim)
+                        .child("Installing update…"),
+                )
+                .into_any_element(),
+            UpdateState::Manual { release, why } => Button::new("update-available")
+                .small()
+                .tab_stop(false)
+                .ghost()
+                .icon(Icon::empty().path("icons/download.svg"))
+                .label(format!("{} available", release.version))
+                .tooltip(format!("Open the release page ({why})"))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_release_page(cx)))
+                .into_any_element(),
+            UpdateState::Failed {
+                release: Some(release),
+                message,
+            } => Button::new("update-available")
+                .small()
+                .tab_stop(false)
+                .ghost()
+                .icon(Icon::empty().path("icons/download.svg"))
+                .label(format!("{} available", release.version))
+                .tooltip(format!("Update failed: {message}. Open the release page"))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_release_page(cx)))
+                .into_any_element(),
+            _ => return None,
+        };
+        Some(div().flex_shrink_0().px_2().child(inner).into_any_element())
     }
 
     /// One window-control button (minimize / maximize / close). `hover_bg` is the
@@ -2913,6 +3101,7 @@ impl Workspace {
                     // `Workspace::new` never runs — save geometry and tabs here.
                     super::save_window_geometry(window);
                     this.flush_session(cx);
+                    this.install_on_quit();
                     session::store::flush_scratch();
                     window.remove_window()
                 }
@@ -3162,6 +3351,12 @@ impl Render for Workspace {
                 self.modal = None;
             }
         }
+        // Nothing to restart into any more (installing, or it failed).
+        if self.modal == Some(Modal::ConfirmRestart)
+            && !matches!(self.update, UpdateState::Ready { .. })
+        {
+            self.modal = None;
+        }
         let dialog = match self.modal {
             Some(Modal::Connections) => {
                 Some(self.render_conn_manager(window, cx).into_any_element())
@@ -3175,6 +3370,7 @@ impl Render for Workspace {
             Some(Modal::ConfirmApply(id)) => {
                 Some(self.render_confirm_apply(id, window, cx).into_any_element())
             }
+            Some(Modal::ConfirmRestart) => Some(self.render_confirm_restart(cx).into_any_element()),
             Some(Modal::TrustHostKey) => self
                 .host_key
                 .as_ref()

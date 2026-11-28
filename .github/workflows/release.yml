@@ -9,6 +9,10 @@ name: release
 # `release/v<version>` branch, deleted at the end whatever the outcome. If
 # master moved while the builds ran, the fast-forward fails: just run it again.
 #
+# The asset names (skimrow-<os>-<arch>.zip, from build.yml's matrix) are what
+# installed copies look for when they update themselves
+# (`skimrow_update::asset_name`): renaming one breaks updating for them.
+#
 # The notes input on the web form is ONE line (pasted newlines are lost), so
 # for multi-line markdown run it from the CLI:
 #   gh workflow run release.yml -f version=0.6.0 -f notes="$(cat notes.md)"

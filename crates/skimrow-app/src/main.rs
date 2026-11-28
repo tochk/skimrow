@@ -57,6 +57,9 @@ fn main() {
     if let Some(dir) = skimrow_config::migrate_legacy_config() {
         eprintln!("[skimrow] moved the zdb settings to {}", dir.display());
     }
+    // Updates: note where we're installed (before an update could replace
+    // the binary) and clear what the last update left behind.
+    workspace::init_updates();
     let settings = skimrow_config::Settings::load().unwrap_or_default();
     let theme = settings.theme;
     let saved_window = settings.window;

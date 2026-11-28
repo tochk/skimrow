@@ -29,6 +29,9 @@ pub(super) enum Modal {
     ConfirmApply(u64),
     /// "Trust this SSH server?" — its host key is new (`Workspace::host_key`).
     TrustHostKey,
+    /// "Restart to update?" — restarting would lose staged edits, an open
+    /// transaction or a running query (`Workspace::unsaved_work`).
+    ConfirmRestart,
 }
 
 /// Dialog focus bookkeeping (see the module docs).

@@ -45,6 +45,7 @@ mod query;
 mod session;
 mod tabs;
 mod tree;
+mod update;
 mod util;
 mod view;
 
@@ -57,6 +58,8 @@ use keynav::*;
 use modal::{Modal, ModalFocus};
 use query::QueryLog;
 use tree::{NodeMeta, SchemaTree};
+pub use update::init_updates;
+use update::UpdateState;
 use util::{entry_config, entry_to_config, oneline, order_by_sql, rel_icon, window_title};
 
 actions!(
@@ -104,6 +107,8 @@ enum PaletteCmd {
     Format,
     QueryLog,
     Messages,
+    CheckUpdates,
+    RestartToUpdate,
 }
 
 const PALETTE_COMMANDS: &[(&str, PaletteCmd)] = &[
@@ -128,6 +133,8 @@ const PALETTE_COMMANDS: &[(&str, PaletteCmd)] = &[
     ("Previous tab", PaletteCmd::PrevTab),
     ("Close tab", PaletteCmd::CloseTab),
     ("Apply staged changes", PaletteCmd::ApplyEdits),
+    ("Check for updates", PaletteCmd::CheckUpdates),
+    ("Restart to update", PaletteCmd::RestartToUpdate),
 ];
 
 /// Lightweight milestone logging to stderr, enabled by setting `SKIMROW_LOG`.
@@ -248,6 +255,11 @@ pub struct Workspace {
 
     /// Middle-click autoscroll, while it is running (see `autoscroll.rs`).
     autoscroll: Option<AutoScroll>,
+
+    /// The updater (see `update.rs`), and whether its once-a-second repaint
+    /// (download progress) is scheduled.
+    update: UpdateState,
+    update_ticker: bool,
 
     /// Focus the active grid on the next render (see `flush_pending_focus`).
     pending_grid_focus: bool,
@@ -377,13 +389,23 @@ impl Workspace {
         // Fires on the OS close path (Windows close button / Alt+F4); the Linux
         // title-bar button calls `save_window_geometry` itself before removing
         // the window.
+        // Quitting also installs a downloaded update (`update.rs`).
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
             save_window_geometry(window);
-            let _ = weak.update(cx, |this, cx| this.flush_session(cx));
+            let _ = weak.update(cx, |this, cx| {
+                this.flush_session(cx);
+                this.install_on_quit();
+            });
             session::store::flush_scratch();
             true
         });
+        // Cmd+Q / an app-level quit skips the window's close hook.
+        cx.on_app_quit(|this, _cx| {
+            this.install_on_quit();
+            async {}
+        })
+        .detach();
 
         let mut this = Self {
             db,
@@ -434,6 +456,8 @@ impl Workspace {
             pending_geom: None,
             geom_flush: false,
             autoscroll: None,
+            update: UpdateState::Idle,
+            update_ticker: false,
             pending_grid_focus: false,
             root_focus: cx.focus_handle(),
         };
@@ -446,6 +470,9 @@ impl Workspace {
             this.modal = Some(Modal::Connections);
             this.conn_adding = this.settings.connections.is_empty();
         }
+        // Never under test: no network, no timers left running.
+        #[cfg(not(test))]
+        this.start_update_checks(cx);
         this
     }
 
@@ -581,6 +608,8 @@ impl Workspace {
             PaletteCmd::ApplyEdits => self.apply_active(cx),
             PaletteCmd::QueryLog => self.toggle_query_log(cx),
             PaletteCmd::Messages => self.toggle_messages(cx),
+            PaletteCmd::CheckUpdates => self.check_for_updates(true, cx),
+            PaletteCmd::RestartToUpdate => self.request_update_restart(window, cx),
         }
     }
 
